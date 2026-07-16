@@ -1,0 +1,20 @@
+{
+  "name": "dirigera-local-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local-only HTTP bridge and automation engine for an IKEA DIRIGERA hub",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --env-file-if-exists=.env --watch src/server.js",
+    "check": "for file in src/*.js test/*.js; do node --check \"$file\" || exit 1; done",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "dirigera": "2.0.0",
+    "ws": "8.21.0"
+  }
+}
