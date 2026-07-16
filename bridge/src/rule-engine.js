@@ -408,6 +408,24 @@ function actionAttributes(action) {
   return attributes;
 }
 
+function actionAttributeRequests(attributes) {
+  const remaining = { ...attributes };
+  const isOn = remaining.isOn;
+  delete remaining.isOn;
+
+  const requests = [];
+  if (isOn === true) requests.push({ isOn: true });
+  for (const attribute of ["lightLevel", "colorTemperature"]) {
+    if (remaining[attribute] !== undefined) {
+      requests.push({ [attribute]: remaining[attribute] });
+      delete remaining[attribute];
+    }
+  }
+  if (Object.keys(remaining).length) requests.push(remaining);
+  if (isOn === false) requests.push({ isOn: false });
+  return requests;
+}
+
 function minuteKey(date) {
   return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}-${date.getHours()}-${date.getMinutes()}`;
 }
@@ -622,11 +640,13 @@ export class RuleEngine {
       for (const action of rule.actions) {
         const attributes = actionAttributes(action);
         const actionVersion = this.#beginDeviceAction(action.deviceId);
-        await this.#setDeviceAttributes({
-          id: action.deviceId,
-          attributes,
-          transitionTime: action.transitionTime,
-        });
+        for (const attributeRequest of actionAttributeRequests(attributes)) {
+          await this.#setDeviceAttributes({
+            id: action.deviceId,
+            attributes: attributeRequest,
+            transitionTime: action.transitionTime,
+          });
+        }
 
         const delay = action.offAfterSeconds ?? rule.offAfterSeconds;
         if (

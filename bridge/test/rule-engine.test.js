@@ -40,11 +40,17 @@ test("motion and button events execute mapped light attributes once", async () =
   assert.deepEqual(calls, [
     {
       id: "light-1",
-      attributes: {
-        isOn: true,
-        lightLevel: 72,
-        colorTemperature: 2700,
-      },
+      attributes: { isOn: true },
+      transitionTime: undefined,
+    },
+    {
+      id: "light-1",
+      attributes: { lightLevel: 72 },
+      transitionTime: undefined,
+    },
+    {
+      id: "light-1",
+      attributes: { colorTemperature: 2700 },
       transitionTime: undefined,
     },
   ]);
