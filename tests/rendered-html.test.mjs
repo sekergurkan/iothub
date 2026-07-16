@@ -52,6 +52,8 @@ test("ships product metadata and removes starter preview artifacts", async () =>
   assert.match(layout, /lang="tr"/);
   assert.match(client, /function RuleBuilder/);
   assert.match(client, /X-Bridge-Key/);
+  assert.match(client, /yuva-connection-mode/);
+  assert.match(client, /syncBridge\(\)\.catch/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
   assert.match(packageJson, /"name": "yuva-dirigera-control"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

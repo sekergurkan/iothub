@@ -557,8 +557,10 @@ export function HomeControl() {
         const legacySettings = legacy ? (JSON.parse(legacy) as Partial<BridgeSettings>) : {};
         const url = window.localStorage.getItem("yuva-bridge-url") || legacySettings.url;
         const key = window.sessionStorage.getItem("yuva-bridge-key") || legacySettings.key;
+        const savedMode = window.localStorage.getItem("yuva-connection-mode");
         if (url || key) setBridgeSettings((current) => ({ url: url || current.url, key: key || "" }));
         if (legacySettings.key) window.sessionStorage.setItem("yuva-bridge-key", legacySettings.key);
+        if (key && savedMode !== "demo") setMode("bridge");
         window.localStorage.removeItem("yuva-bridge-settings");
       } catch {
         // Connection preferences are optional; the key remains session-scoped.
@@ -579,7 +581,7 @@ export function HomeControl() {
     if (!status.connected) throw new Error("DIRIGERA henüz eşleştirilmemiş");
     const home = await requestBridge(settings, "/api/home");
     const normalized = normalizeHome(home);
-    if (normalized.length) setDevices(normalized);
+    setDevices(normalized);
     const [rulesPayload, eventsPayload] = await Promise.all([
       requestBridge(settings, "/api/rules").catch(() => []),
       requestBridge(settings, "/api/events?limit=100").catch(() => ({ events: [] })),
@@ -594,12 +596,18 @@ export function HomeControl() {
   }, [bridgeSettings]);
 
   useEffect(() => {
-    if (mode !== "bridge") return;
+    if (mode !== "bridge" || !bridgeSettings.key) return;
+    const initialSync = window.setTimeout(() => {
+      syncBridge().catch(() => setBridgeOnline(false));
+    }, 0);
     const timer = window.setInterval(() => {
       syncBridge().catch(() => setBridgeOnline(false));
     }, 8000);
-    return () => window.clearInterval(timer);
-  }, [mode, syncBridge]);
+    return () => {
+      window.clearTimeout(initialSync);
+      window.clearInterval(timer);
+    };
+  }, [bridgeSettings.key, mode, syncBridge]);
 
   async function sendDeviceAttributes(id: string, attributes: Record<string, unknown>) {
     if (mode !== "bridge") return;
@@ -895,10 +903,12 @@ export function HomeControl() {
               bridgeSettings={bridgeSettings}
               openConnection={() => setConnectionModalOpen(true)}
               useDemo={() => {
+                window.localStorage.setItem("yuva-connection-mode", "demo");
                 setMode("demo");
                 setBridgeOnline(false);
                 setDevices(initialDevices);
                 setRules(initialRules);
+                setTimeline(initialTimeline);
                 showToast("Demo evine dönüldü");
               }}
             />
@@ -942,6 +952,7 @@ export function HomeControl() {
                 });
               }
               await syncBridge(settings);
+              window.localStorage.setItem("yuva-connection-mode", "bridge");
               setConnectionModalOpen(false);
               showToast("DIRIGERA köprüsüne bağlanıldı");
             } catch (error) {
@@ -950,10 +961,12 @@ export function HomeControl() {
             }
           }}
           onDemo={() => {
+            window.localStorage.setItem("yuva-connection-mode", "demo");
             setMode("demo");
             setBridgeOnline(false);
             setDevices(initialDevices);
             setRules(initialRules);
+            setTimeline(initialTimeline);
             setConnectionModalOpen(false);
             showToast("Demo modunda devam ediliyor");
           }}
