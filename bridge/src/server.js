@@ -363,9 +363,11 @@ export async function createBridgeService(options = {}) {
     ...(options.homeAssistantDependencies ?? {}),
   });
 
-  const getDevice = (id) =>
+  const getDevice = (id, options) =>
     id.startsWith("ha_")
-      ? homeAssistantManager.getDevice(id)
+      ? options?.fresh
+        ? homeAssistantManager.getDeviceFresh(id)
+        : homeAssistantManager.getDevice(id)
       : hubManager.run((client) => client.devices.get({ id }));
   const setDeviceAttributes = (request) =>
     request.id.startsWith("ha_")

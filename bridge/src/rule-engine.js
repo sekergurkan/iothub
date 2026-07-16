@@ -57,6 +57,8 @@ const NUMBER_CONDITION_OPERATORS = new Set([
   "lessThan",
   "lessThanOrEqual",
 ]);
+const EFFECT_RESTORE_WATCHDOG_CHECKS = 5;
+const EFFECT_RESTORE_WATCHDOG_INTERVAL_MS = 1_000;
 
 export class RuleValidationError extends Error {
   constructor(message, path = undefined) {
@@ -781,6 +783,23 @@ function effectSnapshot(device, deviceId) {
   };
 }
 
+function effectPowerMatchesSnapshot(device, snapshot) {
+  return (
+    isObject(device) &&
+    isObject(device.attributes) &&
+    typeof device.attributes.isOn === "boolean" &&
+    device.attributes.isOn === snapshot.isOn
+  );
+}
+
+function effectRestoreUnverifiedError(deviceId, cause) {
+  const error = new Error(`The restored power state of device ${deviceId} could not be confirmed.`, {
+    cause,
+  });
+  error.code = "RULE_EFFECT_RESTORE_UNVERIFIED";
+  return error;
+}
+
 function defaultWait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -1157,7 +1176,9 @@ export class RuleEngine {
     }
 
     const snapshotResults = await Promise.allSettled(
-      rule.actions.map((action) => this.#getDevice(action.deviceId)),
+      rule.actions.map((action) =>
+        this.#getDevice(action.deviceId, { fresh: true }),
+      ),
     );
     const targets = [];
     for (const [actionIndex, result] of snapshotResults.entries()) {
@@ -1177,6 +1198,9 @@ export class RuleEngine {
           deviceId: action.deviceId,
           actionIndex,
           snapshot: effectSnapshot(result.value, action.deviceId),
+          verifyRestore:
+            result.value?.provider === "home-assistant" ||
+            action.deviceId.startsWith("ha_"),
         });
       } catch (error) {
         failures.push({
@@ -1239,53 +1263,147 @@ export class RuleEngine {
         if (waitMilliseconds > 0) await this.#wait(waitMilliseconds);
       }
     } finally {
-      const restoreResults = await Promise.allSettled(
-        targets.map(async (target) => {
+      await this.#restoreEffectTargets(targets, failures);
+      await this.#watchEffectRestores(targets, failures);
+    }
+
+    return failures;
+  }
+
+  async #restoreEffectTargets(targets, failures) {
+    const restoreResults = await Promise.allSettled(
+      targets.map(async (target) => {
+        if (
+          this.#deviceActionVersions.get(target.deviceId) !== target.actionVersion
+        ) {
+          return;
+        }
+        const requests = actionAttributeRequests(target.snapshot);
+        for (const [requestIndex, attributes] of requests.entries()) {
           if (
             this.#deviceActionVersions.get(target.deviceId) !== target.actionVersion
           ) {
             return;
           }
-          const requests = actionAttributeRequests(target.snapshot);
-          for (const [requestIndex, attributes] of requests.entries()) {
-            if (
-              this.#deviceActionVersions.get(target.deviceId) !== target.actionVersion
-            ) {
-              return;
-            }
-            try {
-              await this.#setDeviceAttributes({
-                id: target.deviceId,
-                attributes,
-                transitionTime: 0,
-              });
-            } catch (error) {
-              failures.push({
-                deviceId: target.deviceId,
-                actionIndex: target.actionIndex,
-                requestIndex,
-                stage: "restore",
-                error,
-              });
-            }
+          try {
+            await this.#setDeviceAttributes({
+              id: target.deviceId,
+              attributes,
+              transitionTime: 0,
+            });
+          } catch (error) {
+            failures.push({
+              deviceId: target.deviceId,
+              actionIndex: target.actionIndex,
+              requestIndex,
+              stage: "restore",
+              error,
+            });
           }
-        }),
+        }
+      }),
+    );
+    restoreResults.forEach((result, index) => {
+      if (result.status === "rejected") {
+        const target = targets[index];
+        failures.push({
+          deviceId: target.deviceId,
+          actionIndex: target.actionIndex,
+          requestIndex: 0,
+          stage: "restore",
+          error: result.reason,
+        });
+      }
+    });
+  }
+
+  async #watchEffectRestores(targets, failures) {
+    let pending = targets.filter((target) => target.verifyRestore);
+    if (!pending.length) return;
+
+    let unresolved = [];
+    for (
+      let checkIndex = 0;
+      checkIndex < EFFECT_RESTORE_WATCHDOG_CHECKS;
+      checkIndex += 1
+    ) {
+      await this.#wait(EFFECT_RESTORE_WATCHDOG_INTERVAL_MS);
+      pending = pending.filter(
+        (target) =>
+          this.#deviceActionVersions.get(target.deviceId) === target.actionVersion,
       );
-      restoreResults.forEach((result, index) => {
-        if (result.status === "rejected") {
-          const target = targets[index];
-          failures.push({
-            deviceId: target.deviceId,
-            actionIndex: target.actionIndex,
-            requestIndex: 0,
-            stage: "restore",
-            error: result.reason,
+      if (!pending.length) return;
+
+      const reads = await Promise.allSettled(
+        pending.map((target) =>
+          this.#getDevice(target.deviceId, { fresh: true }),
+        ),
+      );
+      unresolved = [];
+      reads.forEach((result, index) => {
+        const target = pending[index];
+        if (
+          result.status === "rejected" ||
+          !effectPowerMatchesSnapshot(result.value, target.snapshot)
+        ) {
+          unresolved.push({
+            target,
+            error:
+              result.status === "rejected"
+                ? result.reason
+                : effectRestoreUnverifiedError(target.deviceId),
           });
         }
       });
+
+      await Promise.allSettled(
+        unresolved.map(({ target }) => {
+          if (
+            this.#deviceActionVersions.get(target.deviceId) !== target.actionVersion
+          ) {
+            return undefined;
+          }
+          return this.#setDeviceAttributes({
+            id: target.deviceId,
+            attributes: { isOn: target.snapshot.isOn },
+            transitionTime: 0,
+          });
+        }),
+      );
     }
 
-    return failures;
+    if (!unresolved.length) return;
+    await this.#wait(EFFECT_RESTORE_WATCHDOG_INTERVAL_MS);
+    const finalTargets = unresolved
+      .map(({ target }) => target)
+      .filter(
+        (target) =>
+          this.#deviceActionVersions.get(target.deviceId) === target.actionVersion,
+      );
+    const finalReads = await Promise.allSettled(
+      finalTargets.map((target) =>
+        this.#getDevice(target.deviceId, { fresh: true }),
+      ),
+    );
+    finalReads.forEach((result, index) => {
+      const target = finalTargets[index];
+      if (
+        result.status === "fulfilled" &&
+        effectPowerMatchesSnapshot(result.value, target.snapshot)
+      ) {
+        return;
+      }
+      failures.push({
+        deviceId: target.deviceId,
+        actionIndex: target.actionIndex,
+        requestIndex: EFFECT_RESTORE_WATCHDOG_CHECKS,
+        stage: "restoreVerify",
+        error: effectRestoreUnverifiedError(
+          target.deviceId,
+          result.status === "rejected" ? result.reason : undefined,
+        ),
+      });
+    });
   }
 
   async #recordRun(id, lastRun) {

@@ -238,6 +238,66 @@ test("Home Assistant manager exposes Xiaomi devices and maps controls to service
   );
 });
 
+test("getDeviceFresh reads the primary light entity and returns its current power and brightness", async (t) => {
+  FakeWebSocket.instances.length = 0;
+  const requestedPaths = [];
+  const cachedStates = FIXTURE_STATES.map((state) =>
+    state.entity_id === "light.mi_bulb_white"
+      ? {
+          ...state,
+          last_changed: "2026-07-16T10:00:00+00:00",
+          last_updated: "2026-07-16T10:00:00+00:00",
+        }
+      : state,
+  );
+  const freshLightState = {
+    entity_id: "light.mi_bulb_white",
+    state: "off",
+    last_changed: "2026-07-16T10:01:00+00:00",
+    last_updated: "2026-07-16T10:01:00+00:00",
+    attributes: {
+      friendly_name: "Mi Bulb White",
+      brightness: 64,
+      color_temp_kelvin: 2_700,
+      supported_color_modes: ["color_temp"],
+    },
+  };
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    requestedPaths.push(url.pathname);
+    if (url.pathname === "/api/states") return jsonResponse(cachedStates);
+    if (url.pathname === "/api/states/light.mi_bulb_white") {
+      return jsonResponse(freshLightState);
+    }
+    return jsonResponse({}, 404);
+  };
+  const manager = new HomeAssistantManager({
+    config: {
+      homeAssistant: {
+        baseUrl: "http://127.0.0.1:8124",
+        accessToken: "a-valid-long-lived-access-token",
+      },
+    },
+    persistConfig: async () => {},
+    onEvent: async () => {},
+    fetchImpl,
+    WebSocketImpl: FakeWebSocket,
+  });
+  t.after(() => manager.stop());
+
+  await manager.initialize();
+  const cachedBulb = manager.listDevices().find((device) => device.type === "light");
+  assert.equal(cachedBulb.attributes.isOn, true);
+  assert.equal(cachedBulb.attributes.lightLevel, 85);
+
+  const freshBulb = await manager.getDeviceFresh(cachedBulb.id);
+
+  assert.equal(requestedPaths.at(-1), "/api/states/light.mi_bulb_white");
+  assert.equal(freshBulb.attributes.isOn, false);
+  assert.equal(freshBulb.attributes.lightLevel, 25);
+  assert.equal(manager.getDevice(cachedBulb.id).attributes.isOn, false);
+});
+
 test("Home Assistant URL validation permits local addresses and rejects public or credentialed URLs", () => {
   assert.equal(validateHomeAssistantBaseUrl("http://127.0.0.1:8124/"), "http://127.0.0.1:8124");
   assert.equal(validateHomeAssistantBaseUrl("http://homeassistant.local:8123"), "http://homeassistant.local:8123");

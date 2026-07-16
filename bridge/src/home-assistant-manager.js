@@ -798,6 +798,55 @@ export class HomeAssistantManager {
     return structuredClone(device);
   }
 
+  async getDeviceFresh(id) {
+    const group = this.#groups.get(id);
+    if (!group) {
+      throw apiError("HOME_ASSISTANT_DEVICE_NOT_FOUND", "The Home Assistant device was not found.", 404);
+    }
+    const primaryDomain =
+      group.type === "light"
+        ? "light"
+        : group.type === "airPurifier"
+          ? "fan"
+          : group.type === "dehumidifier"
+            ? "humidifier"
+            : null;
+    const primary = primaryDomain ? this.#entityFor(group, primaryDomain) : null;
+    if (!primary) {
+      throw apiError(
+        "HOME_ASSISTANT_STATE_UNAVAILABLE",
+        "The current Home Assistant device state is unavailable.",
+        409,
+      );
+    }
+
+    const state = await this.#request(
+      `/api/states/${encodeURIComponent(primary.entityId)}`,
+    );
+    if (!state || state.entity_id !== primary.entityId || typeof state.state !== "string") {
+      throw apiError(
+        "HOME_ASSISTANT_INVALID_RESPONSE",
+        "Home Assistant returned an invalid device state.",
+        502,
+      );
+    }
+
+    const cachedState = this.#states.get(primary.entityId);
+    const cachedUpdatedAt = Date.parse(
+      cachedState?.last_updated ?? cachedState?.last_changed ?? "",
+    );
+    const freshUpdatedAt = Date.parse(state.last_updated ?? state.last_changed ?? "");
+    if (
+      !Number.isFinite(cachedUpdatedAt) ||
+      !Number.isFinite(freshUpdatedAt) ||
+      freshUpdatedAt >= cachedUpdatedAt
+    ) {
+      this.#states.set(primary.entityId, state);
+      this.#rebuildDevices();
+    }
+    return this.getDevice(id);
+  }
+
   #entityFor(group, domain, pattern = null) {
     return findEntity(
       group.entries,

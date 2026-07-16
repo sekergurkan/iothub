@@ -304,6 +304,207 @@ test("a failed blink phase is reported without preventing later phases or restor
   engine.stop();
 });
 
+test("Home Assistant blink restore watchdog repairs delayed power drift and verifies for five seconds", async () => {
+  const deviceId = "ha_wc-light";
+  let clock = 0;
+  const calls = [];
+  const reads = [];
+  const waits = [];
+  const executions = [];
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: async (id, options) => {
+      reads.push({ id, options: structuredClone(options), calledAt: clock });
+      return {
+        id,
+        type: "light",
+        provider: "home-assistant",
+        isReachable: true,
+        attributes: {
+          isOn: clock === 4_000,
+          lightLevel: 33,
+          colorTemperature: 2_700,
+        },
+      };
+    },
+    setDeviceAttributes: async (request) => {
+      calls.push({ ...structuredClone(request), calledAt: clock });
+    },
+    wait: async (milliseconds) => {
+      waits.push(milliseconds);
+      clock += milliseconds;
+    },
+    now: () => clock,
+    onExecution: (execution) => executions.push(execution),
+  });
+  const rule = await engine.create(
+    blinkRule({
+      actions: [{ deviceId, isOn: true }],
+      effect: {
+        type: "blink",
+        durationSeconds: 1,
+        intervalMilliseconds: 500,
+        restoreState: true,
+      },
+    }),
+  );
+
+  await engine.run(rule.id);
+
+  assert.deepEqual(waits, [500, 500, 1_000, 1_000, 1_000, 1_000, 1_000]);
+  assert.deepEqual(
+    reads.map(({ calledAt }) => calledAt),
+    [0, 2_000, 3_000, 4_000, 5_000, 6_000],
+    "fresh state is checked throughout the full five-second watchdog window",
+  );
+  assert.ok(reads.every((read) => read.options?.fresh === true));
+  assert.deepEqual(
+    calls
+      .filter((call) => call.calledAt === 4_000)
+      .map((call) => call.attributes),
+    [{ isOn: false }],
+    "a late Home Assistant state reversal is corrected immediately",
+  );
+  assert.equal(executions.at(-1).status, "success");
+  engine.stop();
+});
+
+test("a persistent Home Assistant restore mismatch is reported as restoreVerify failure", async () => {
+  const deviceId = "ha_wc-light";
+  let clock = 0;
+  const calls = [];
+  const reads = [];
+  const executions = [];
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: async (id, options) => {
+      reads.push({ id, options: structuredClone(options), calledAt: clock });
+      return {
+        id,
+        type: "light",
+        provider: "home-assistant",
+        isReachable: true,
+        attributes: { isOn: clock === 0 ? false : true },
+      };
+    },
+    setDeviceAttributes: async (request) => {
+      calls.push({ ...structuredClone(request), calledAt: clock });
+    },
+    wait: async (milliseconds) => {
+      clock += milliseconds;
+    },
+    now: () => clock,
+    onExecution: (execution) => executions.push(execution),
+  });
+  const rule = await engine.create(
+    blinkRule({
+      actions: [{ deviceId, isOn: true }],
+      effect: {
+        type: "blink",
+        durationSeconds: 1,
+        intervalMilliseconds: 500,
+        restoreState: true,
+      },
+    }),
+  );
+
+  await assert.rejects(engine.run(rule.id), (error) => {
+    assert.equal(error.code, "RULE_ACTIONS_PARTIAL_FAILURE");
+    assert.deepEqual(error.failures, [
+      {
+        deviceId,
+        actionIndex: 0,
+        requestIndex: 5,
+        stage: "restoreVerify",
+        code: "RULE_EFFECT_RESTORE_UNVERIFIED",
+      },
+    ]);
+    return true;
+  });
+
+  assert.deepEqual(
+    reads.map(({ calledAt }) => calledAt),
+    [0, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000],
+  );
+  assert.deepEqual(
+    calls
+      .filter((call) => call.calledAt >= 2_000)
+      .map((call) => [call.calledAt, call.attributes]),
+    [
+      [2_000, { isOn: false }],
+      [3_000, { isOn: false }],
+      [4_000, { isOn: false }],
+      [5_000, { isOn: false }],
+      [6_000, { isOn: false }],
+    ],
+    "the expected power state is reasserted after every failed watchdog check",
+  );
+  assert.equal(executions.at(-1).status, "error");
+  engine.stop();
+});
+
+test("superseding a Home Assistant light stops the restore watchdog from reasserting stale state", async () => {
+  const deviceId = "ha_wc-light";
+  let clock = 0;
+  let engine;
+  const calls = [];
+  const reads = [];
+  const executions = [];
+  engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: async (id, options) => {
+      reads.push({ id, options: structuredClone(options), calledAt: clock });
+      return {
+        id,
+        type: "light",
+        provider: "home-assistant",
+        isReachable: true,
+        attributes: { isOn: clock === 0 ? false : true },
+      };
+    },
+    setDeviceAttributes: async (request) => {
+      calls.push({ ...structuredClone(request), calledAt: clock });
+    },
+    wait: async (milliseconds) => {
+      clock += milliseconds;
+      if (clock === 3_000) engine.supersedeDevice(deviceId);
+    },
+    now: () => clock,
+    onExecution: (execution) => executions.push(execution),
+  });
+  const rule = await engine.create(
+    blinkRule({
+      actions: [{ deviceId, isOn: true }],
+      effect: {
+        type: "blink",
+        durationSeconds: 1,
+        intervalMilliseconds: 500,
+        restoreState: true,
+      },
+    }),
+  );
+
+  await engine.run(rule.id);
+
+  assert.deepEqual(
+    reads.map(({ calledAt }) => calledAt),
+    [0, 2_000],
+    "the superseded target is not read again",
+  );
+  assert.deepEqual(
+    calls
+      .filter((call) => call.calledAt >= 2_000)
+      .map((call) => [call.calledAt, call.attributes]),
+    [[2_000, { isOn: false }]],
+    "no stale restore is issued after a manual action supersedes the effect",
+  );
+  assert.equal(executions.at(-1).status, "success");
+  engine.stop();
+});
+
 test("disabled optional rule features are omitted and enabled empty features are rejected", async () => {
   const { engine } = createEngine();
   const rule = await engine.create({
