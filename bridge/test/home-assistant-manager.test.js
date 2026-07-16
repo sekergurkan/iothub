@@ -169,6 +169,11 @@ test("Home Assistant manager exposes Xiaomi devices and maps controls to service
     attributes: { lightLevel: 60, colorTemperature: 2700 },
     transitionTime: 2_000,
   });
+  await manager.setDeviceAttributes({
+    id: bulb.id,
+    attributes: { isOn: true },
+    transitionTime: 0,
+  });
   await manager.setDeviceAttributes({ id: camera.id, attributes: { privacy: true } });
   await manager.setDeviceAttributes({ id: camera.id, attributes: { isOn: false } });
   assert.deepEqual(
@@ -180,6 +185,7 @@ test("Home Assistant manager exposes Xiaomi devices and maps controls to service
       ["/api/services/humidifier/turn_off", { entity_id: "humidifier.smart_dehumidifier" }],
       ["/api/services/light/turn_on", { entity_id: "light.mi_bulb_white", brightness_pct: 60, transition: 2 }],
       ["/api/services/light/turn_on", { entity_id: "light.mi_bulb_white", color_temp_kelvin: 2700, transition: 2 }],
+      ["/api/services/light/turn_on", { entity_id: "light.mi_bulb_white", transition: 0 }],
       ["/api/services/switch/turn_on", { entity_id: "switch.camera_c701_privacy" }],
       ["/api/services/switch/turn_off", { entity_id: "switch.camera_c701_power" }],
     ],

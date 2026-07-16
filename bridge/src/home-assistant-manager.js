@@ -817,7 +817,7 @@ export class HomeAssistantManager {
     const requested = { ...attributes };
     const operations = [];
     const transition =
-      Number.isInteger(transitionTime) && transitionTime > 0 ? transitionTime / 1_000 : undefined;
+      Number.isInteger(transitionTime) && transitionTime >= 0 ? transitionTime / 1_000 : undefined;
     const light = group.type === "light" ? this.#entityFor(group, "light") : null;
     const fan = this.#entityFor(group, "fan");
     const humidifier = this.#entityFor(group, "humidifier");

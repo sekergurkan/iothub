@@ -68,6 +68,7 @@ curl http://127.0.0.1:8787/api/status \
 | `POST` | `/api/scenes/:id/trigger` | Sahneyi tetikler |
 | `GET`, `POST` | `/api/rules` | Kuralları listeler / oluşturur |
 | `GET`, `PUT`, `PATCH`, `DELETE` | `/api/rules/:id` | Tek kural CRUD |
+| `POST` | `/api/rules/:id/run` | Kaydedilmiş kuralı elle test eder |
 | `GET` | `/api/events?limit=100&after=0` | Bellekteki son WebSocket/kural olayları |
 | `GET` | `/api/events/stream` | Server-Sent Events akışı |
 
@@ -132,6 +133,30 @@ Desteklenen tetikleyiciler:
 Durumu okunamayan veya ilgili özniteliği bulunmayan cihaz koşulu güvenli biçimde `false` kabul edilir; kural aksiyonları çalışmaz. Aynı değerlendirmede aynı cihaz yalnız bir kez okunur.
 
 Bir kuralda en fazla 32 aksiyon bulunabilir. `brightness`, DIRIGERA `lightLevel`; `temperature` ise `colorTemperature` özniteliğine dönüştürülür. İleri kullanım için bir aksiyonda doğrudan `attributes` ve `transitionTime` da verilebilir. Aksiyon düzeyindeki `offAfterSeconds`, kural düzeyindeki değeri geçersiz kılar ve yalnız cihazı açan aksiyonlarda kullanılabilir. `cooldownSeconds`, peş peşe gelen tetiklemeler arasındaki en kısa süreyi belirler. Etkinleştirilmeyen ileri seçenekler kural verisine eklenmez.
+
+Birden fazla ışığı aynı anda uyarı amacıyla yanıp söndürmek için kural düzeyinde `effect` kullanılabilir. Köprü bütün hedeflerin açık/kapalı, parlaklık ve renk sıcaklığı durumunu ışıklara dokunmadan önce okur; fazları paralel gönderir ve süre sonunda her hedefi kendi başlangıç durumuna döndürür. Efekt sırasında başka bir kural veya panelden doğrudan cihaz komutu verilirse yeni komut öncelik kazanır ve eski efekt o cihazın durumunu geri yazmaz.
+
+```json
+{
+  "trigger": {
+    "type": "deviceEvent",
+    "deviceId": "CAMERA_DEVICE_ID",
+    "eventType": "babyCry"
+  },
+  "actions": [
+    { "deviceId": "LIGHT_1", "isOn": true },
+    { "deviceId": "LIGHT_2", "isOn": true }
+  ],
+  "effect": {
+    "type": "blink",
+    "durationSeconds": 5,
+    "intervalMilliseconds": 500,
+    "restoreState": true
+  }
+}
+```
+
+Blink efektinde aksiyonlar yalnız benzersiz hedef seçer ve `isOn: true` içerir; geçiş, otomatik kapatma veya başka özniteliklerle birleştirilemez. Süre `1–60` saniye, faz aralığı `100–2000` milisaniye olabilir ve en az bir tam yanıp-sönme çevrimi bulunmalıdır.
 
 Bir hedef cihaz hata verirse kural motoru diğer hedefleri yine dener. Denenen çalıştırma `lastRun` ve `runCount` alanlarına kaydedilir; sonuç `RULE_ACTIONS_PARTIAL_FAILURE` kodlu bir `bridgeRuleFailed` olayıdır. Açma komutu başarılı olduysa, daha sonraki parlaklık veya sıcaklık komutu hata verse bile güvenlik için gecikmeli kapatma zamanlayıcısı kurulur.
 

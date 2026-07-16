@@ -61,6 +61,10 @@ test("ships product metadata and removes starter preview artifacts", async () =>
   assert.match(client, /passthroughAttributes/);
   assert.match(client, /scheduleTestAutoOff/);
   assert.match(client, /pendingRuleWritesRef/);
+  assert.match(client, /eventType: "babyCry"/);
+  assert.match(client, /Yanıp sönerek uyar/);
+  assert.match(client, /restoreState: true/);
+  assert.match(client, /\/api\/rules\/\$\{encodeURIComponent\(rule\.id\)\}\/run/);
   assert.match(client, /X-Bridge-Key/);
   assert.match(client, /yuva-connection-mode/);
   assert.match(client, /syncBridge\(\)\.catch/);

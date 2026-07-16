@@ -435,6 +435,46 @@ function normalizeAction(input, index) {
   };
 }
 
+function normalizeEffect(input) {
+  if (input === undefined || input === null) return undefined;
+  if (!isObject(input)) fail("effect must be an object.", "effect");
+  if (input.type !== "blink") {
+    fail("effect.type must be blink.", "effect.type");
+  }
+
+  const durationSeconds = optionalInteger(input.durationSeconds, "effect.durationSeconds", {
+    minimum: 1,
+    maximum: 60,
+  });
+  const intervalMilliseconds = optionalInteger(
+    input.intervalMilliseconds,
+    "effect.intervalMilliseconds",
+    { minimum: 100, maximum: 2_000 },
+  );
+  if (durationSeconds === undefined) {
+    fail("effect.durationSeconds is required.", "effect.durationSeconds");
+  }
+  if (intervalMilliseconds === undefined) {
+    fail("effect.intervalMilliseconds is required.", "effect.intervalMilliseconds");
+  }
+  if (durationSeconds * 1_000 < intervalMilliseconds * 2) {
+    fail(
+      "effect.durationSeconds must allow at least one complete blink cycle.",
+      "effect.durationSeconds",
+    );
+  }
+  if (input.restoreState !== true) {
+    fail("effect.restoreState must be true.", "effect.restoreState");
+  }
+
+  return {
+    type: "blink",
+    durationSeconds,
+    intervalMilliseconds,
+    restoreState: true,
+  };
+}
+
 function isIsoDate(value) {
   return (
     typeof value === "string" &&
@@ -455,6 +495,12 @@ export function normalizeRule(
 
   const trigger = normalizeTrigger(input.trigger ?? existing?.trigger);
   const conditions = normalizeConditions(input.conditions ?? existing?.conditions);
+  const effectValue = Object.hasOwn(input, "effect")
+    ? input.effect
+    : replace
+      ? undefined
+      : existing?.effect;
+  const effect = normalizeEffect(effectValue);
   const actionInput = input.actions ?? existing?.actions;
   if (!Array.isArray(actionInput) || actionInput.length === 0 || actionInput.length > 32) {
     fail("actions must contain between 1 and 32 actions.", "actions");
@@ -480,6 +526,31 @@ export function normalizeRule(
     "cooldownSeconds",
     { minimum: 0, maximum: 86_400 },
   );
+
+  if (effect) {
+    const targetIds = new Set();
+    for (const [index, action] of actions.entries()) {
+      const attributes = actionAttributes(action);
+      if (
+        attributes.isOn !== true ||
+        Object.keys(attributes).length !== 1 ||
+        action.transitionTime !== undefined ||
+        action.offAfterSeconds !== undefined
+      ) {
+        fail(
+          "Blink effect actions may only select a device with isOn set to true.",
+          `actions[${index}]`,
+        );
+      }
+      if (targetIds.has(action.deviceId)) {
+        fail("Blink effect targets must be unique.", `actions[${index}].deviceId`);
+      }
+      targetIds.add(action.deviceId);
+    }
+    if (offAfterSeconds !== undefined) {
+      fail("offAfterSeconds cannot be combined with a blink effect.", "offAfterSeconds");
+    }
+  }
 
   if (
     offAfterSeconds !== undefined &&
@@ -508,6 +579,7 @@ export function normalizeRule(
     trigger,
     conditions,
     actions,
+    ...(effect ? { effect } : {}),
     ...(offAfterSeconds !== undefined ? { offAfterSeconds } : {}),
     ...(cooldownSeconds !== undefined ? { cooldownSeconds } : {}),
     lastRun,
@@ -575,12 +647,16 @@ function actionFailuresError(failures) {
     `${failures.length} rule action request(s) could not be completed.`,
   );
   error.code = "RULE_ACTIONS_PARTIAL_FAILURE";
-  error.failures = failures.map(({ deviceId, actionIndex, requestIndex, error: cause }) => ({
-    deviceId,
-    actionIndex,
-    requestIndex,
-    code: typeof cause?.code === "string" ? cause.code : "DEVICE_ACTION_FAILED",
-  }));
+  error.failures = failures.map(
+    ({ deviceId, actionIndex, requestIndex, stage, phaseIndex, error: cause }) => ({
+      deviceId,
+      actionIndex,
+      requestIndex,
+      ...(stage ? { stage } : {}),
+      ...(phaseIndex !== undefined ? { phaseIndex } : {}),
+      code: typeof cause?.code === "string" ? cause.code : "DEVICE_ACTION_FAILED",
+    }),
+  );
   return error;
 }
 
@@ -665,6 +741,50 @@ function actionAttributeRequests(attributes) {
   return requests;
 }
 
+function effectSnapshot(device, deviceId) {
+  if (typeof device?.type === "string" && device.type !== "light") {
+    const error = new Error(`Device ${deviceId} is not a light.`);
+    error.code = "RULE_EFFECT_TARGET_NOT_LIGHT";
+    throw error;
+  }
+  const attributes = isObject(device?.attributes) ? device.attributes : {};
+  if (typeof attributes.isOn !== "boolean") {
+    const error = new Error(`The power state of device ${deviceId} is unavailable.`);
+    error.code = "RULE_EFFECT_STATE_UNAVAILABLE";
+    throw error;
+  }
+  if (device.isReachable === false) {
+    const error = new Error(`Device ${deviceId} is unreachable.`);
+    error.code = "DEVICE_UNREACHABLE";
+    throw error;
+  }
+
+  const lightLevel = attributes.lightLevel;
+  const colorTemperature = attributes.colorTemperature;
+  const hasLightLevel =
+    attributes.isOn &&
+    typeof lightLevel === "number" &&
+    Number.isFinite(lightLevel) &&
+    lightLevel >= 1 &&
+    lightLevel <= 100;
+  const hasColorTemperature =
+    attributes.isOn &&
+    typeof colorTemperature === "number" &&
+    Number.isFinite(colorTemperature) &&
+    colorTemperature >= 1_500 &&
+    colorTemperature <= 6_500;
+
+  return {
+    isOn: attributes.isOn,
+    ...(hasLightLevel ? { lightLevel } : {}),
+    ...(hasColorTemperature ? { colorTemperature } : {}),
+  };
+}
+
+function defaultWait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 function minuteKey(date) {
   return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}-${date.getHours()}-${date.getMinutes()}`;
 }
@@ -675,6 +795,8 @@ export class RuleEngine {
   #setDeviceAttributes;
   #getDevice;
   #onExecution;
+  #wait;
+  #now;
   #mutationQueue = Promise.resolve();
   #running = new Set();
   #pendingEvents = new Map();
@@ -692,6 +814,8 @@ export class RuleEngine {
     setDeviceAttributes,
     getDevice = null,
     onExecution = () => {},
+    wait = defaultWait,
+    now = () => Date.now(),
   }) {
     this.#rules = rules.map((rule, index) => {
       try {
@@ -715,6 +839,8 @@ export class RuleEngine {
     this.#setDeviceAttributes = setDeviceAttributes;
     this.#getDevice = getDevice;
     this.#onExecution = onExecution;
+    this.#wait = wait;
+    this.#now = now;
   }
 
   start() {
@@ -742,6 +868,32 @@ export class RuleEngine {
   get(id) {
     const rule = this.#rules.find((item) => item.id === id);
     return rule ? structuredClone(rule) : null;
+  }
+
+  supersedeDevice(deviceId) {
+    this.#beginDeviceAction(normalizeDeviceId(deviceId, "deviceId"));
+  }
+
+  supersedeAllDevices() {
+    for (const deviceId of [...this.#deviceActionVersions.keys()]) {
+      this.#beginDeviceAction(deviceId);
+    }
+  }
+
+  async run(id) {
+    const rule = this.#rules.find((item) => item.id === id);
+    if (!rule) {
+      const error = new Error("The requested rule does not exist.");
+      error.code = "RULE_NOT_FOUND";
+      error.status = 404;
+      throw error;
+    }
+    await this.#execute(rule, {
+      id: `manual-${randomUUID()}`,
+      type: "manual",
+      time: new Date().toISOString(),
+    });
+    return this.get(id);
   }
 
   #mutate(mutator) {
@@ -930,37 +1082,41 @@ export class RuleEngine {
   async #executeOnce(rule, triggerEvent) {
     const startedAt = new Date().toISOString();
     try {
-      const failures = [];
-      for (const [actionIndex, action] of rule.actions.entries()) {
-        const attributes = actionAttributes(action);
-        const actionVersion = this.#beginDeviceAction(action.deviceId);
-        let turnedOn = false;
-        const requests = actionAttributeRequests(attributes);
-        for (const [requestIndex, attributeRequest] of requests.entries()) {
-          try {
-            await this.#setDeviceAttributes({
-              id: action.deviceId,
-              attributes: attributeRequest,
-              transitionTime: action.transitionTime,
-            });
-            if (attributeRequest.isOn === true) turnedOn = true;
-          } catch (error) {
-            failures.push({
-              deviceId: action.deviceId,
-              actionIndex,
-              requestIndex,
-              error,
-            });
+      const failures = rule.effect
+        ? await this.#executeBlinkEffect(rule)
+        : [];
+      if (!rule.effect) {
+        for (const [actionIndex, action] of rule.actions.entries()) {
+          const attributes = actionAttributes(action);
+          const actionVersion = this.#beginDeviceAction(action.deviceId);
+          let turnedOn = false;
+          const requests = actionAttributeRequests(attributes);
+          for (const [requestIndex, attributeRequest] of requests.entries()) {
+            try {
+              await this.#setDeviceAttributes({
+                id: action.deviceId,
+                attributes: attributeRequest,
+                transitionTime: action.transitionTime,
+              });
+              if (attributeRequest.isOn === true) turnedOn = true;
+            } catch (error) {
+              failures.push({
+                deviceId: action.deviceId,
+                actionIndex,
+                requestIndex,
+                error,
+              });
+            }
           }
-        }
 
-        const delay = action.offAfterSeconds ?? rule.offAfterSeconds;
-        if (
-          delay &&
-          turnedOn &&
-          this.#deviceActionVersions.get(action.deviceId) === actionVersion
-        ) {
-          this.#scheduleOff(rule, action, delay, actionVersion);
+          const delay = action.offAfterSeconds ?? rule.offAfterSeconds;
+          if (
+            delay &&
+            turnedOn &&
+            this.#deviceActionVersions.get(action.deviceId) === actionVersion
+          ) {
+            this.#scheduleOff(rule, action, delay, actionVersion);
+          }
         }
       }
 
@@ -984,6 +1140,152 @@ export class RuleEngine {
       });
       throw error;
     }
+  }
+
+  async #executeBlinkEffect(rule) {
+    const failures = [];
+    if (typeof this.#getDevice !== "function") {
+      const error = new Error("Device snapshots are unavailable for the blink effect.");
+      error.code = "RULE_EFFECT_UNAVAILABLE";
+      return rule.actions.map((action, actionIndex) => ({
+        deviceId: action.deviceId,
+        actionIndex,
+        requestIndex: 0,
+        stage: "snapshot",
+        error,
+      }));
+    }
+
+    const snapshotResults = await Promise.allSettled(
+      rule.actions.map((action) => this.#getDevice(action.deviceId)),
+    );
+    const targets = [];
+    for (const [actionIndex, result] of snapshotResults.entries()) {
+      const action = rule.actions[actionIndex];
+      if (result.status === "rejected") {
+        failures.push({
+          deviceId: action.deviceId,
+          actionIndex,
+          requestIndex: 0,
+          stage: "snapshot",
+          error: result.reason,
+        });
+        continue;
+      }
+      try {
+        targets.push({
+          deviceId: action.deviceId,
+          actionIndex,
+          snapshot: effectSnapshot(result.value, action.deviceId),
+        });
+      } catch (error) {
+        failures.push({
+          deviceId: action.deviceId,
+          actionIndex,
+          requestIndex: 0,
+          stage: "snapshot",
+          error,
+        });
+      }
+    }
+
+    for (const target of targets) {
+      target.actionVersion = this.#beginDeviceAction(target.deviceId);
+    }
+
+    const durationMilliseconds = rule.effect.durationSeconds * 1_000;
+    const startedAt = this.#now();
+    const deadline = startedAt + durationMilliseconds;
+    let phaseIndex = 0;
+    let isOn = true;
+
+    try {
+      while (!this.#stopped && this.#now() < deadline && targets.length) {
+        const activeTargets = targets.filter(
+          (target) =>
+            this.#deviceActionVersions.get(target.deviceId) === target.actionVersion,
+        );
+        if (!activeTargets.length) break;
+        const results = await Promise.allSettled(
+          activeTargets.map((target) =>
+            this.#setDeviceAttributes({
+              id: target.deviceId,
+              attributes: { isOn },
+              transitionTime: 0,
+            }),
+          ),
+        );
+        results.forEach((result, index) => {
+          if (result.status === "rejected") {
+            const target = activeTargets[index];
+            failures.push({
+              deviceId: target.deviceId,
+              actionIndex: target.actionIndex,
+              requestIndex: phaseIndex,
+              phaseIndex,
+              stage: "phase",
+              error: result.reason,
+            });
+          }
+        });
+
+        phaseIndex += 1;
+        isOn = !isOn;
+        const nextPhaseAt = Math.min(
+          deadline,
+          startedAt + phaseIndex * rule.effect.intervalMilliseconds,
+        );
+        const waitMilliseconds = nextPhaseAt - this.#now();
+        if (waitMilliseconds > 0) await this.#wait(waitMilliseconds);
+      }
+    } finally {
+      const restoreResults = await Promise.allSettled(
+        targets.map(async (target) => {
+          if (
+            this.#deviceActionVersions.get(target.deviceId) !== target.actionVersion
+          ) {
+            return;
+          }
+          const requests = actionAttributeRequests(target.snapshot);
+          for (const [requestIndex, attributes] of requests.entries()) {
+            if (
+              this.#deviceActionVersions.get(target.deviceId) !== target.actionVersion
+            ) {
+              return;
+            }
+            try {
+              await this.#setDeviceAttributes({
+                id: target.deviceId,
+                attributes,
+                transitionTime: 0,
+              });
+            } catch (error) {
+              failures.push({
+                deviceId: target.deviceId,
+                actionIndex: target.actionIndex,
+                requestIndex,
+                stage: "restore",
+                error,
+              });
+            }
+          }
+        }),
+      );
+      restoreResults.forEach((result, index) => {
+        if (result.status === "rejected") {
+          const target = targets[index];
+          failures.push({
+            deviceId: target.deviceId,
+            actionIndex: target.actionIndex,
+            requestIndex: 0,
+            stage: "restore",
+            error: result.reason,
+          });
+        }
+      });
+    }
+
+    return failures;
   }
 
   async #recordRun(id, lastRun) {

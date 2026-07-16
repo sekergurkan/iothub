@@ -15,6 +15,295 @@ function createEngine(overrides = {}) {
   return { engine, calls, executions };
 }
 
+function blinkRule(overrides = {}) {
+  return {
+    id: "baby-cry-blink",
+    name: "Baby cry light warning",
+    trigger: { type: "deviceEvent", deviceId: "camera-1", eventType: "babyCry" },
+    actions: [
+      { deviceId: "light-on", isOn: true },
+      { deviceId: "light-off", isOn: true },
+    ],
+    effect: {
+      type: "blink",
+      durationSeconds: 1,
+      intervalMilliseconds: 100,
+      restoreState: true,
+    },
+    ...overrides,
+  };
+}
+
+test("blink effects normalize, persist, reload, and reject unsafe combinations", async () => {
+  const saves = [];
+  const { engine } = createEngine({
+    saveRules: async (rules) => saves.push(structuredClone(rules)),
+  });
+  const created = await engine.create(blinkRule());
+
+  assert.deepEqual(created.effect, {
+    type: "blink",
+    durationSeconds: 1,
+    intervalMilliseconds: 100,
+    restoreState: true,
+  });
+  assert.deepEqual(saves.at(-1)[0].effect, created.effect);
+
+  const reloaded = new RuleEngine({
+    rules: saves.at(-1),
+    saveRules: async () => {},
+    setDeviceAttributes: async () => {},
+  });
+  assert.deepEqual(reloaded.get(created.id).effect, created.effect);
+
+  await assert.rejects(
+    engine.create(
+      blinkRule({
+        id: "blink-no-restore",
+        effect: {
+          type: "blink",
+          durationSeconds: 1,
+          intervalMilliseconds: 100,
+          restoreState: false,
+        },
+      }),
+    ),
+    /restoreState must be true/,
+  );
+  await assert.rejects(
+    engine.create(
+      blinkRule({
+        id: "blink-too-short",
+        effect: {
+          type: "blink",
+          durationSeconds: 1,
+          intervalMilliseconds: 600,
+          restoreState: true,
+        },
+      }),
+    ),
+    /at least one complete blink cycle/,
+  );
+  await assert.rejects(
+    engine.create(
+      blinkRule({
+        id: "blink-with-brightness",
+        actions: [{ deviceId: "light-on", isOn: true, brightness: 100 }],
+      }),
+    ),
+    /may only select a device with isOn set to true/,
+  );
+  await assert.rejects(
+    engine.create(
+      blinkRule({
+        id: "blink-duplicate-target",
+        actions: [
+          { deviceId: "light-on", isOn: true },
+          { deviceId: "light-on", isOn: true },
+        ],
+      }),
+    ),
+    /targets must be unique/,
+  );
+  await assert.rejects(
+    engine.create(blinkRule({ id: "blink-with-auto-off", offAfterSeconds: 5 })),
+    /cannot be combined with a blink effect/,
+  );
+
+  assert.equal(saves.at(-1).length, 1, "rejected rules are never persisted");
+  reloaded.stop();
+  engine.stop();
+});
+
+test("blink phases start together and restore each light's exact prior power state", async () => {
+  let clock = 0;
+  let phaseInFlight = 0;
+  let maximumPhaseInFlight = 0;
+  const waits = [];
+  const calls = [];
+  const devices = new Map([
+    [
+      "light-on",
+      {
+        id: "light-on",
+        type: "light",
+        isReachable: true,
+        attributes: { isOn: true, lightLevel: 42, colorTemperature: 2_700 },
+      },
+    ],
+    [
+      "light-off",
+      {
+        id: "light-off",
+        type: "light",
+        isReachable: true,
+        attributes: { isOn: false, lightLevel: 85, colorTemperature: 4_000 },
+      },
+    ],
+  ]);
+  const executions = [];
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: async (id) => structuredClone(devices.get(id)),
+    setDeviceAttributes: async (request) => {
+      const calledAt = clock;
+      calls.push({ ...structuredClone(request), calledAt });
+      if (calledAt < 1_000) {
+        phaseInFlight += 1;
+        maximumPhaseInFlight = Math.max(maximumPhaseInFlight, phaseInFlight);
+      }
+      await new Promise((resolve) => queueMicrotask(resolve));
+      if (calledAt < 1_000) phaseInFlight -= 1;
+    },
+    wait: async (milliseconds) => {
+      waits.push(milliseconds);
+      clock += milliseconds;
+    },
+    now: () => clock,
+    onExecution: (execution) => executions.push(execution),
+  });
+  const rule = await engine.create(blinkRule());
+
+  const completed = await engine.run(rule.id);
+
+  assert.equal(completed.runCount, 1);
+  assert.deepEqual(waits, Array(10).fill(100));
+  assert.equal(maximumPhaseInFlight, 2, "both lights start each blink phase concurrently");
+  assert.deepEqual(
+    calls.slice(0, 2).map(({ id, attributes, transitionTime, calledAt }) => ({
+      id,
+      attributes,
+      transitionTime,
+      calledAt,
+    })),
+    [
+      { id: "light-on", attributes: { isOn: true }, transitionTime: 0, calledAt: 0 },
+      { id: "light-off", attributes: { isOn: true }, transitionTime: 0, calledAt: 0 },
+    ],
+  );
+  assert.equal(
+    calls.filter((call) => call.calledAt < 1_000).length,
+    20,
+    "ten synchronized on/off phases run during the one-second effect",
+  );
+  assert.deepEqual(
+    calls
+      .filter((call) => call.calledAt === 1_000 && call.id === "light-on")
+      .map(({ attributes, transitionTime }) => ({ attributes, transitionTime })),
+    [
+      { attributes: { isOn: true }, transitionTime: 0 },
+      { attributes: { lightLevel: 42 }, transitionTime: 0 },
+      { attributes: { colorTemperature: 2_700 }, transitionTime: 0 },
+    ],
+  );
+  assert.deepEqual(
+    calls
+      .filter((call) => call.calledAt === 1_000 && call.id === "light-off")
+      .map(({ attributes, transitionTime }) => ({ attributes, transitionTime })),
+    [{ attributes: { isOn: false }, transitionTime: 0 }],
+  );
+  assert.equal(executions.at(-1).status, "success");
+  engine.stop();
+});
+
+test("a failed blink phase is reported without preventing later phases or restoration", async () => {
+  let clock = 0;
+  let failedOnce = false;
+  const calls = [];
+  const executions = [];
+  const devices = new Map([
+    [
+      "light-on",
+      {
+        id: "light-on",
+        type: "light",
+        isReachable: true,
+        attributes: { isOn: true, lightLevel: 25, colorTemperature: 3_000 },
+      },
+    ],
+    [
+      "light-off",
+      {
+        id: "light-off",
+        type: "light",
+        isReachable: true,
+        attributes: { isOn: false },
+      },
+    ],
+  ]);
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: async (id) => structuredClone(devices.get(id)),
+    setDeviceAttributes: async (request) => {
+      calls.push({ ...structuredClone(request), calledAt: clock });
+      if (!failedOnce && request.id === "light-on" && clock === 0) {
+        failedOnce = true;
+        const error = new Error("temporary device failure");
+        error.code = "DEVICE_UNREACHABLE";
+        throw error;
+      }
+    },
+    wait: async (milliseconds) => {
+      clock += milliseconds;
+    },
+    now: () => clock,
+    onExecution: (execution) => executions.push(execution),
+  });
+  const rule = await engine.create(
+    blinkRule({
+      effect: {
+        type: "blink",
+        durationSeconds: 1,
+        intervalMilliseconds: 500,
+        restoreState: true,
+      },
+    }),
+  );
+
+  await assert.rejects(engine.run(rule.id), (error) => {
+    assert.equal(error.code, "RULE_ACTIONS_PARTIAL_FAILURE");
+    assert.deepEqual(error.failures, [
+      {
+        deviceId: "light-on",
+        actionIndex: 0,
+        requestIndex: 0,
+        stage: "phase",
+        phaseIndex: 0,
+        code: "DEVICE_UNREACHABLE",
+      },
+    ]);
+    return true;
+  });
+
+  assert.deepEqual(
+    calls
+      .filter((call) => call.calledAt === 500)
+      .map((call) => [call.id, call.attributes]),
+    [
+      ["light-on", { isOn: false }],
+      ["light-off", { isOn: false }],
+    ],
+    "the next synchronized phase still reaches both targets",
+  );
+  assert.deepEqual(
+    calls
+      .filter((call) => call.calledAt === 1_000 && call.id === "light-on")
+      .map((call) => call.attributes),
+    [{ isOn: true }, { lightLevel: 25 }, { colorTemperature: 3_000 }],
+  );
+  assert.deepEqual(
+    calls
+      .filter((call) => call.calledAt === 1_000 && call.id === "light-off")
+      .map((call) => call.attributes),
+    [{ isOn: false }],
+  );
+  assert.equal(engine.get(rule.id).runCount, 1);
+  assert.equal(executions.at(-1).status, "error");
+  engine.stop();
+});
+
 test("disabled optional rule features are omitted and enabled empty features are rejected", async () => {
   const { engine } = createEngine();
   const rule = await engine.create({
