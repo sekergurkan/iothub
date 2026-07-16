@@ -1,0 +1,11 @@
+services:
+  homeassistant:
+    container_name: iothub-homeassistant
+    image: ghcr.io/home-assistant/home-assistant:stable
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8124:8123"
+    volumes:
+      - ./config:/config
+    environment:
+      TZ: Europe/Istanbul

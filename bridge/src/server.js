@@ -9,10 +9,11 @@ import {
   saveRuleDocument,
 } from "./config.js";
 import { EventStore } from "./event-store.js";
+import { HomeAssistantManager } from "./home-assistant-manager.js";
 import { HubManager } from "./hub-manager.js";
 import { RuleEngine, RuleValidationError } from "./rule-engine.js";
 
-const BRIDGE_VERSION = "1.0.0";
+const BRIDGE_VERSION = "1.1.0";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
 const MAX_BODY_BYTES = 64 * 1024;
@@ -323,27 +324,59 @@ export async function createBridgeService(options = {}) {
   const sseResponses = new Set();
   let ruleEngine;
 
+  const handleProviderEvent = async (event) => {
+    eventStore.record(event);
+    await ruleEngine?.handleEvent(event);
+  };
+
   const hubManager = new HubManager({
     config,
     persistConfig: async (nextConfig) => {
-      config = await saveConfig(paths, nextConfig);
+      config = await saveConfig(paths, {
+        ...config,
+        gatewayIP: nextConfig.gatewayIP,
+        accessToken: nextConfig.accessToken,
+      });
       return config;
     },
-    onEvent: async (event) => {
-      eventStore.record(event);
-      await ruleEngine?.handleEvent(event);
-    },
+    onEvent: handleProviderEvent,
     onInternalError: (error) => {
       eventStore.record(makeBridgeEvent({ status: "error", source: "eventHandler", error }));
     },
   });
 
+  const homeAssistantManager = new HomeAssistantManager({
+    config,
+    persistConfig: async (nextConfig) => {
+      config = await saveConfig(paths, {
+        ...config,
+        homeAssistant: nextConfig.homeAssistant,
+      });
+      return config;
+    },
+    onEvent: handleProviderEvent,
+    onInternalError: (error) => {
+      eventStore.record(
+        makeBridgeEvent({ status: "error", source: "homeAssistantEventHandler", error }),
+      );
+    },
+    ...(options.homeAssistantDependencies ?? {}),
+  });
+
+  const getDevice = (id) =>
+    id.startsWith("ha_")
+      ? homeAssistantManager.getDevice(id)
+      : hubManager.run((client) => client.devices.get({ id }));
+  const setDeviceAttributes = (request) =>
+    request.id.startsWith("ha_")
+      ? homeAssistantManager.setDeviceAttributes(request)
+      : hubManager.run((client) => client.devices.setAttributes(request));
+
   ruleEngine = new RuleEngine({
     rules: ruleDocument.rules,
     saveRules: (rules) => saveRuleDocument(paths, rules),
-    getDevice: (id) => hubManager.run((client) => client.devices.get({ id })),
-    setDeviceAttributes: (request) =>
-      hubManager.run((client) => client.devices.setAttributes(request)),
+    getDevice,
+    setDeviceAttributes,
     onExecution: (execution) => eventStore.record(makeBridgeEvent(execution)),
   });
 
@@ -418,6 +451,7 @@ export async function createBridgeService(options = {}) {
           lastConnectedAt: hubManager.state.lastConnectedAt,
           lastEventAt: hubManager.state.lastEventAt,
           lastError: hubManager.state.lastError,
+          homeAssistant: homeAssistantManager.status(),
           ruleCount: ruleEngine.list().length,
           eventCount: eventStore.list({ limit: 5_000 }).length,
           uptimeSeconds: Math.floor(process.uptime()),
@@ -429,9 +463,59 @@ export async function createBridgeService(options = {}) {
 
     if (pathname === "/api/home") {
       if (request.method !== "GET") throw methodNotAllowed(["GET"]);
-      const home = await hubManager.run((client) => client.home());
-      sendJson(response, 200, home, commonHeaders);
+      let home = { devices: [], rooms: [], scenes: [] };
+      let dirigeraError;
+      if (hubManager.paired) {
+        try {
+          home = await hubManager.run((client) => client.home());
+        } catch (error) {
+          dirigeraError = error;
+        }
+      }
+      const homeAssistantDevices = homeAssistantManager.listDevices();
+      if (dirigeraError && homeAssistantDevices.length === 0) throw dirigeraError;
+      sendJson(
+        response,
+        200,
+        {
+          ...(home && typeof home === "object" ? home : {}),
+          devices: [
+            ...(Array.isArray(home?.devices) ? home.devices : []),
+            ...homeAssistantDevices,
+          ],
+        },
+        commonHeaders,
+      );
       return;
+    }
+
+    if (pathname === "/api/integrations/home-assistant/status") {
+      if (request.method !== "GET") throw methodNotAllowed(["GET"]);
+      sendJson(
+        response,
+        200,
+        { ok: true, homeAssistant: homeAssistantManager.status() },
+        commonHeaders,
+      );
+      return;
+    }
+
+    if (pathname === "/api/integrations/home-assistant/configure") {
+      if (request.method === "POST") {
+        const body = await readJsonBody(request);
+        const status = await homeAssistantManager.configure({
+          baseUrl: body.baseUrl,
+          accessToken: body.accessToken,
+        });
+        sendJson(response, 200, { ok: true, homeAssistant: status }, commonHeaders);
+        return;
+      }
+      if (request.method === "DELETE") {
+        const status = await homeAssistantManager.forget();
+        sendJson(response, 200, { ok: true, homeAssistant: status }, commonHeaders);
+        return;
+      }
+      throw methodNotAllowed(["POST", "DELETE"]);
     }
 
     const deviceMatch = /^\/api\/devices\/([^/]+)$/.exec(pathname);
@@ -441,9 +525,7 @@ export async function createBridgeService(options = {}) {
       const body = await readJsonBody(request);
       const attributes = validateAttributes(body.attributes);
       const transitionTime = validateTransitionTime(body.transitionTime);
-      await hubManager.run((client) =>
-        client.devices.setAttributes({ id, attributes, transitionTime }),
-      );
+      await setDeviceAttributes({ id, attributes, transitionTime });
       sendJson(response, 200, { ok: true, id }, commonHeaders);
       return;
     }
@@ -609,14 +691,16 @@ export async function createBridgeService(options = {}) {
     },
     paths,
     hubManager,
+    homeAssistantManager,
     ruleEngine,
     eventStore,
     async initializeHub() {
-      await hubManager.initialize();
+      await Promise.allSettled([hubManager.initialize(), homeAssistantManager.initialize()]);
     },
     async close() {
       ruleEngine.stop();
       hubManager.stop();
+      homeAssistantManager.stop();
       for (const response of sseResponses) response.end();
       sseResponses.clear();
       if (!server.listening) return;

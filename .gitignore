@@ -46,3 +46,6 @@ next-env.d.ts
 # Local DIRIGERA bridge secrets and dependencies
 /bridge/.data/
 /bridge/node_modules/
+
+# Local Home Assistant runtime data and OAuth tokens
+/home-assistant/config/

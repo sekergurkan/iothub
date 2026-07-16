@@ -40,6 +40,40 @@ test("HTTP API protects local state and persists rule CRUD", async (t) => {
   assert.equal(status.status, 200);
   assert.equal(statusBody.paired, false);
   assert.equal(statusBody.connected, false);
+  assert.deepEqual(statusBody.homeAssistant, {
+    configured: false,
+    connected: false,
+    listening: false,
+    baseUrl: null,
+    deviceCount: 0,
+    lastConnectedAt: null,
+    lastEventAt: null,
+    lastError: null,
+  });
+
+  const homeAssistantStatus = await fetch(
+    `${base}/api/integrations/home-assistant/status`,
+    { headers },
+  );
+  assert.equal(homeAssistantStatus.status, 200);
+  assert.deepEqual((await homeAssistantStatus.json()).homeAssistant, statusBody.homeAssistant);
+
+  const invalidHomeAssistant = await fetch(
+    `${base}/api/integrations/home-assistant/configure`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        baseUrl: "https://example.com",
+        accessToken: "not-a-real-long-lived-token",
+      }),
+    },
+  );
+  assert.equal(invalidHomeAssistant.status, 400);
+  assert.equal(
+    (await invalidHomeAssistant.json()).error.code,
+    "INVALID_HOME_ASSISTANT_URL",
+  );
 
   const createdResponse = await fetch(`${base}/api/rules`, {
     method: "POST",

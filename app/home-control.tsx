@@ -7,10 +7,13 @@ import {
   BatteryMedium,
   Bell,
   Check,
+  Camera,
   ChevronRight,
   CircleHelp,
   CirclePower,
   Clock3,
+  Droplets,
+  Fan,
   Footprints,
   House,
   Info,
@@ -46,7 +49,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type View = "home" | "rooms" | "devices" | "rules" | "activity" | "settings";
-type DeviceType = "light" | "motion" | "button";
+type DeviceType = "light" | "motion" | "button" | "airPurifier" | "dehumidifier" | "camera";
 type TriggerType = "motion" | "occupancy" | "button" | "time";
 type ClickPattern = "singlePress" | "doublePress" | "longPress";
 type DeviceStateAttribute =
@@ -55,7 +58,15 @@ type DeviceStateAttribute =
   | "isDetected"
   | "lightLevel"
   | "batteryPercentage"
-  | "colorTemperature";
+  | "colorTemperature"
+  | "pm25"
+  | "pm10"
+  | "humidity"
+  | "targetHumidity"
+  | "temperature"
+  | "filterLife"
+  | "percentage"
+  | "waterTankFull";
 type DeviceStateOperator =
   | "equals"
   | "notEquals"
@@ -95,6 +106,19 @@ type SmartDevice = {
   lastEvent?: string;
   automatedBy?: string;
   controlLabel?: string;
+  provider: "dirigera" | "home-assistant";
+  capabilities?: Partial<Record<"power" | "brightness" | "colorTemperature" | "percentage" | "presetMode" | "targetHumidity" | "privacy", boolean>>;
+  pm25?: number;
+  pm10?: number;
+  humidity?: number;
+  targetHumidity?: number;
+  ambientTemperature?: number;
+  filterLife?: number;
+  percentage?: number;
+  presetMode?: string;
+  availableModes?: string[];
+  waterTankFull?: boolean;
+  privacy?: boolean;
 };
 
 type Room = {
@@ -134,7 +158,7 @@ type TimelineEvent = {
   at: string;
   title: string;
   detail: string;
-  kind: "motion" | "light" | "button" | "rule" | "system";
+  kind: "motion" | "light" | "button" | "rule" | "system" | "camera";
 };
 
 type BridgeSettings = {
@@ -142,12 +166,25 @@ type BridgeSettings = {
   key: string;
 };
 
+type HomeAssistantStatus = {
+  configured: boolean;
+  connected: boolean;
+  listening: boolean;
+  baseUrl?: string;
+  deviceCount: number;
+  lastError?: string;
+};
+
 type RawDirigeraDevice = {
   id: string;
-  deviceType: string;
+  deviceType?: string;
+  type?: string;
+  provider?: string;
+  source?: string;
+  capabilities?: Record<string, boolean>;
   isReachable?: boolean;
   lastSeen?: string;
-  room?: { name?: string };
+  room?: { name?: string } | string;
   attributes?: {
     customName?: string;
     model?: string;
@@ -160,6 +197,19 @@ type RawDirigeraDevice = {
     relativePosition?: string[];
     switchLabel?: string;
     serialNumber?: string;
+    room?: string;
+    pm25?: number;
+    pm10?: number;
+    humidity?: number;
+    targetHumidity?: number;
+    temperature?: number;
+    filterLife?: number;
+    percentage?: number;
+    presetMode?: string;
+    availableModes?: string[];
+    waterTankFull?: boolean;
+    privacy?: boolean;
+    lastEvent?: string;
   };
 };
 
@@ -173,6 +223,9 @@ type RawBridgeEvent = {
     id?: string;
     deviceId?: string;
     clickPattern?: string;
+    eventType?: string;
+    eventName?: string;
+    provider?: string;
     ruleName?: string;
     attributes?: Record<string, unknown>;
     error?: { message?: string };
@@ -197,6 +250,28 @@ async function requestBridge(settings: BridgeSettings, path: string, init?: Requ
   return response.json();
 }
 
+const disconnectedHomeAssistant: HomeAssistantStatus = {
+  configured: false,
+  connected: false,
+  listening: false,
+  deviceCount: 0,
+};
+
+function normalizeHomeAssistantStatus(raw: unknown): HomeAssistantStatus {
+  const root = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const nested = root.homeAssistant && typeof root.homeAssistant === "object"
+    ? root.homeAssistant as Record<string, unknown>
+    : root;
+  return {
+    configured: nested.configured === true,
+    connected: nested.connected === true,
+    listening: nested.listening === true,
+    baseUrl: typeof nested.baseUrl === "string" ? nested.baseUrl : undefined,
+    deviceCount: typeof nested.deviceCount === "number" && Number.isFinite(nested.deviceCount) ? nested.deviceCount : 0,
+    lastError: typeof nested.lastError === "string" && nested.lastError ? nested.lastError : undefined,
+  };
+}
+
 const rooms: Room[] = [
   { id: "living", name: "Salon", icon: "sofa", color: "violet" },
   { id: "hall", name: "Koridor", icon: "hall", color: "peach" },
@@ -209,6 +284,7 @@ const initialDevices: SmartDevice[] = [
     name: "Koltuk Lambası",
     room: "Salon",
     type: "light",
+    provider: "dirigera",
     model: "TRÅDFRI E27",
     online: true,
     isOn: true,
@@ -220,6 +296,7 @@ const initialDevices: SmartDevice[] = [
     name: "Tavan Işığı",
     room: "Salon",
     type: "light",
+    provider: "dirigera",
     model: "TRÅDFRI GU10",
     online: true,
     isOn: false,
@@ -231,6 +308,7 @@ const initialDevices: SmartDevice[] = [
     name: "Akşam Butonu",
     room: "Salon",
     type: "button",
+    provider: "dirigera",
     model: "STYRBAR",
     online: true,
     battery: 74,
@@ -241,6 +319,7 @@ const initialDevices: SmartDevice[] = [
     name: "Koridor Işığı",
     room: "Koridor",
     type: "light",
+    provider: "dirigera",
     model: "TRÅDFRI E14",
     online: true,
     isOn: true,
@@ -253,6 +332,7 @@ const initialDevices: SmartDevice[] = [
     name: "Hareket Sensörü",
     room: "Koridor",
     type: "motion",
+    provider: "dirigera",
     model: "VALLHORN",
     online: true,
     battery: 86,
@@ -263,6 +343,7 @@ const initialDevices: SmartDevice[] = [
     name: "Başucu Lambası",
     room: "Yatak Odası",
     type: "light",
+    provider: "dirigera",
     model: "TRÅDFRI E14",
     online: true,
     isOn: false,
@@ -382,6 +463,14 @@ const stateAttributeLabels: Record<DeviceStateAttribute, string> = {
   lightLevel: "Parlaklık",
   batteryPercentage: "Pil seviyesi",
   colorTemperature: "Renk sıcaklığı",
+  pm25: "PM2.5",
+  pm10: "PM10",
+  humidity: "Nem",
+  targetHumidity: "Hedef nem",
+  temperature: "Ortam sıcaklığı",
+  filterLife: "Filtre ömrü",
+  percentage: "Fan seviyesi",
+  waterTankFull: "Su haznesi dolu",
 };
 
 const stateOperatorLabels: Record<DeviceStateOperator, string> = {
@@ -397,6 +486,13 @@ const numericStateAttributes = new Set<DeviceStateAttribute>([
   "lightLevel",
   "batteryPercentage",
   "colorTemperature",
+  "pm25",
+  "pm10",
+  "humidity",
+  "targetHumidity",
+  "temperature",
+  "filterLife",
+  "percentage",
 ]);
 
 function mergedActionAttributes(action: AutomationAction) {
@@ -413,6 +509,9 @@ function actionSettingsSummary(action: AutomationAction) {
     attributes.isOn === true ? "aç" : attributes.isOn === false ? "kapat" : "açık/kapalı durumunu koru",
     typeof attributes.lightLevel === "number" ? `%${attributes.lightLevel}` : null,
     typeof attributes.colorTemperature === "number" ? `${attributes.colorTemperature}K` : null,
+    typeof attributes.percentage === "number" ? `fan %${attributes.percentage}` : null,
+    typeof attributes.targetHumidity === "number" ? `hedef nem %${attributes.targetHumidity}` : null,
+    typeof attributes.presetMode === "string" ? `${attributes.presetMode} modu` : null,
     action.offAfterSeconds && attributes.isOn === true
       ? `${Math.round(action.offAfterSeconds / 60)} dk sonra kapat`
       : null,
@@ -424,7 +523,10 @@ function actionSettingsSummary(action: AutomationAction) {
 function DeviceGlyph({ type, size = 20 }: { type: DeviceType; size?: number }) {
   if (type === "light") return <Lightbulb size={size} />;
   if (type === "motion") return <Footprints size={size} />;
-  return <MousePointerClick size={size} />;
+  if (type === "button") return <MousePointerClick size={size} />;
+  if (type === "airPurifier") return <Fan size={size} />;
+  if (type === "dehumidifier") return <Droplets size={size} />;
+  return <Camera size={size} />;
 }
 
 function greeting() {
@@ -445,25 +547,60 @@ function nowLabel() {
 function isRawDirigeraDevice(value: unknown): value is RawDirigeraDevice {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<RawDirigeraDevice>;
-  return typeof candidate.id === "string" && typeof candidate.deviceType === "string";
+  return typeof candidate.id === "string" && (typeof candidate.deviceType === "string" || typeof candidate.type === "string");
+}
+
+function roomNameForRaw(device: RawDirigeraDevice) {
+  if (typeof device.room === "string") return device.room;
+  return device.room?.name;
+}
+
+function numberValue(...values: unknown[]) {
+  const value = values.find((candidate) => typeof candidate === "number" && Number.isFinite(candidate));
+  return typeof value === "number" ? value : undefined;
+}
+
+function booleanValue(...values: unknown[]) {
+  const value = values.find((candidate) => typeof candidate === "boolean");
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function stringValue(...values: unknown[]) {
+  const value = values.find((candidate) => typeof candidate === "string" && candidate.length > 0);
+  return typeof value === "string" ? value : undefined;
 }
 
 function normalizeHome(raw: unknown): SmartDevice[] {
   const home = raw && typeof raw === "object" ? (raw as { devices?: unknown }) : {};
   const rawDevices = Array.isArray(home.devices) ? home.devices.filter(isRawDirigeraDevice) : [];
   return rawDevices
-    .filter((device) =>
-      ["light", "motionSensor", "occupancySensor", "shortcutController", "lightController", "genericSwitch"].includes(
-        device.deviceType,
-      ),
-    )
+    .filter((device) => [
+      "light",
+      "motionSensor",
+      "occupancySensor",
+      "shortcutController",
+      "lightController",
+      "genericSwitch",
+      "button",
+      "airPurifier",
+      "dehumidifier",
+      "camera",
+    ].includes(device.type || device.deviceType || ""))
     .map((device): SmartDevice => {
+      const rawType = device.type || device.deviceType || "genericSwitch";
+      const isHomeAssistant = device.provider === "home-assistant" || device.source === "home-assistant";
       const type: DeviceType =
-        device.deviceType === "light"
+        rawType === "light"
           ? "light"
-          : ["motionSensor", "occupancySensor"].includes(device.deviceType)
+          : ["motionSensor", "occupancySensor"].includes(rawType)
             ? "motion"
-            : "button";
+            : rawType === "airPurifier"
+              ? "airPurifier"
+              : rawType === "dehumidifier"
+                ? "dehumidifier"
+                : rawType === "camera"
+                  ? "camera"
+                  : "button";
       const position = device.attributes?.relativePosition?.[0]?.toLocaleLowerCase("tr-TR");
       const controlLabel =
         position === "top"
@@ -476,24 +613,48 @@ function normalizeHome(raw: unknown): SmartDevice[] {
       const sharedRoom = device.attributes?.serialNumber
         ? rawDevices.find(
             (candidate) =>
-              candidate.room?.name &&
+              roomNameForRaw(candidate) &&
               candidate.attributes?.serialNumber === device.attributes?.serialNumber,
-          )?.room?.name
+          )
         : undefined;
+      const topLevel = device as unknown as Record<string, unknown>;
+      const attributes = (device.attributes || {}) as Record<string, unknown>;
+      const room = stringValue(attributes.room, roomNameForRaw(device), sharedRoom ? roomNameForRaw(sharedRoom) : undefined) || "Odasız";
       const baseName = device.attributes?.customName || device.attributes?.model || "İsimsiz cihaz";
+      const modes = Array.isArray(device.attributes?.availableModes)
+        ? device.attributes.availableModes.filter((mode): mode is string => typeof mode === "string")
+        : Array.isArray(topLevel.availableModes)
+          ? topLevel.availableModes.filter((mode): mode is string => typeof mode === "string")
+          : undefined;
+      const capabilities = device.capabilities || (typeof topLevel.capabilities === "object" && topLevel.capabilities
+        ? topLevel.capabilities as Record<string, boolean>
+        : undefined);
       return {
         id: device.id,
         name: type === "button" && controlLabel ? `${baseName} · ${controlLabel}` : baseName,
-        room: device.room?.name || sharedRoom || "Odasız",
+        room,
         type,
-        model: device.attributes?.model || device.deviceType,
-        online: device.isReachable !== false,
-        battery: device.attributes?.batteryPercentage,
-        isOn: type === "light" && typeof device.attributes?.isOn === "boolean" ? device.attributes.isOn : undefined,
-        brightness: device.attributes?.lightLevel,
-        temperature: device.attributes?.colorTemperature,
-        lastEvent: device.lastSeen,
+        model: stringValue(attributes.model, topLevel.model, rawType) || rawType,
+        online: booleanValue(attributes.isReachable, topLevel.isReachable) !== false,
+        battery: numberValue(attributes.batteryPercentage, topLevel.batteryPercentage),
+        isOn: booleanValue(attributes.isOn, topLevel.isOn),
+        brightness: type === "light" ? numberValue(attributes.lightLevel, topLevel.lightLevel) : undefined,
+        temperature: type === "light" ? numberValue(attributes.colorTemperature, topLevel.colorTemperature) : undefined,
+        lastEvent: stringValue(attributes.lastEvent, topLevel.lastEvent, device.lastSeen),
         controlLabel,
+        provider: isHomeAssistant ? "home-assistant" : "dirigera",
+        capabilities,
+        pm25: numberValue(attributes.pm25, topLevel.pm25),
+        pm10: numberValue(attributes.pm10, topLevel.pm10),
+        humidity: numberValue(attributes.humidity, topLevel.humidity),
+        targetHumidity: numberValue(attributes.targetHumidity, topLevel.targetHumidity),
+        ambientTemperature: numberValue(attributes.temperature, topLevel.temperature),
+        filterLife: numberValue(attributes.filterLife, topLevel.filterLife),
+        percentage: numberValue(attributes.percentage, topLevel.percentage),
+        presetMode: stringValue(attributes.presetMode, topLevel.presetMode),
+        availableModes: modes,
+        waterTankFull: booleanValue(attributes.waterTankFull, topLevel.waterTankFull),
+        privacy: booleanValue(attributes.privacy, topLevel.privacy),
       };
     });
 }
@@ -516,10 +677,33 @@ function normalizeBridgeEvents(raw: unknown, devices: SmartDevice[]): TimelineEv
         ? parsedDate.toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" })
         : "—";
       const id = event.id || `bridge-event-${event.bridgeSequence || index}`;
+      const providerLabel = data.provider === "home-assistant" || device?.provider === "home-assistant" ? "Home Assistant" : "DIRIGERA";
+      const cameraEvent = stringValue(data.eventType, data.eventName, attributes.eventType, attributes.eventName);
+
+      if ((event.type === "deviceEvent" || event.type === "cameraEvent" || device?.type === "camera") && cameraEvent) {
+        const cameraLabels: Record<string, string> = {
+          motion: "hareket algıladı",
+          person: "kişi algıladı",
+          human: "kişi algıladı",
+          pet: "evcil hayvan algıladı",
+          babyCry: "bebek ağlaması algıladı",
+          baby_cry: "bebek ağlaması algıladı",
+          abnormalSound: "olağandışı ses algıladı",
+          abnormal_sound: "olağandışı ses algıladı",
+          geofence: "konum olayı bildirdi",
+        };
+        return {
+          id,
+          at,
+          title: `${deviceName} ${cameraLabels[cameraEvent] || "bir olay algıladı"}`,
+          detail: `${providerLabel} kamera bildirimi · ${cameraEvent}`,
+          kind: "camera",
+        };
+      }
 
       if (event.type === "remotePressEvent") {
         const press = data.clickPattern === "doublePress" ? "Çift basış" : data.clickPattern === "longPress" ? "Uzun basış" : "Tek basış";
-        return { id, at, title: `${deviceName} kullanıldı`, detail: `${press} DIRIGERA tarafından algılandı`, kind: "button" };
+        return { id, at, title: `${deviceName} kullanıldı`, detail: `${press} ${providerLabel} tarafından algılandı`, kind: "button" };
       }
       if (event.type === "bridgeRuleExecuted" || event.type === "bridgeRuleFailed") {
         const failed = event.type === "bridgeRuleFailed";
@@ -536,7 +720,7 @@ function normalizeBridgeEvents(raw: unknown, devices: SmartDevice[]): TimelineEv
           id,
           at,
           title: attributes.isDetected ? `${deviceName} hareket algıladı` : `${deviceName} sakin`,
-          detail: device?.room ? `${device.room} sensör durumu güncellendi` : "Sensör durumu güncellendi",
+          detail: device?.room ? `${device.room} sensör durumu ${providerLabel} üzerinden güncellendi` : "Sensör durumu güncellendi",
           kind: "motion",
         };
       }
@@ -545,13 +729,26 @@ function normalizeBridgeEvents(raw: unknown, devices: SmartDevice[]): TimelineEv
           id,
           at,
           title: `${deviceName} ${attributes.isOn ? "açıldı" : "kapatıldı"}`,
-          detail: "DIRIGERA cihaz durumu güncellendi",
-          kind: "light",
+          detail: `${providerLabel} cihaz durumu güncellendi`,
+          kind: device?.type === "camera" ? "camera" : device?.type === "light" ? "light" : "system",
         };
       }
-      return { id, at, title: `${deviceName} güncellendi`, detail: "DIRIGERA'dan yeni bir olay alındı", kind: "system" };
+      return { id, at, title: `${deviceName} güncellendi`, detail: `${providerLabel} üzerinden yeni bir olay alındı`, kind: device?.type === "camera" ? "camera" : "system" };
     })
     .reverse();
+}
+
+function applyDeviceAttributes(device: SmartDevice, attributes: Record<string, unknown>): SmartDevice {
+  return {
+    ...device,
+    ...(typeof attributes.isOn === "boolean" ? { isOn: attributes.isOn } : {}),
+    ...(typeof attributes.lightLevel === "number" ? { brightness: attributes.lightLevel } : {}),
+    ...(typeof attributes.colorTemperature === "number" ? { temperature: attributes.colorTemperature } : {}),
+    ...(typeof attributes.percentage === "number" ? { percentage: attributes.percentage } : {}),
+    ...(typeof attributes.presetMode === "string" ? { presetMode: attributes.presetMode } : {}),
+    ...(typeof attributes.targetHumidity === "number" ? { targetHumidity: attributes.targetHumidity } : {}),
+    ...(typeof attributes.privacy === "boolean" ? { privacy: attributes.privacy } : {}),
+  };
 }
 
 function describeRule(rule: AutomationRule, devices: SmartDevice[]) {
@@ -590,6 +787,9 @@ function describeRule(rule: AutomationRule, devices: SmartDevice[]) {
     const details = [
       typeof attributes.lightLevel === "number" ? `%${attributes.lightLevel}` : null,
       typeof attributes.colorTemperature === "number" ? `${attributes.colorTemperature}K` : null,
+      typeof attributes.percentage === "number" ? `fan %${attributes.percentage}` : null,
+      typeof attributes.targetHumidity === "number" ? `hedef nem %${attributes.targetHumidity}` : null,
+      typeof attributes.presetMode === "string" ? `${attributes.presetMode} modu` : null,
     ].filter(Boolean);
     const autoOff = action.offAfterSeconds ?? rule.offAfterSeconds;
     const verb = attributes.isOn === true ? "açılsın" : "durumu korunarak ayarlansın";
@@ -638,6 +838,8 @@ export function HomeControl() {
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
   const [editingRule, setEditingRule] = useState<AutomationRule | null>(null);
   const [connectionModalOpen, setConnectionModalOpen] = useState(false);
+  const [homeAssistantModalOpen, setHomeAssistantModalOpen] = useState(false);
+  const [homeAssistantStatus, setHomeAssistantStatus] = useState<HomeAssistantStatus>(disconnectedHomeAssistant);
   const [toast, setToast] = useState<string | null>(null);
   const [mode, setMode] = useState<"demo" | "bridge">("demo");
   const [bridgeOnline, setBridgeOnline] = useState(false);
@@ -721,7 +923,9 @@ export function HomeControl() {
     if (!settings.key) return false;
     const rulesRevision = rulesRevisionRef.current;
     const status = await requestBridge(settings, "/api/status");
-    if (!status.connected) throw new Error("DIRIGERA henüz eşleştirilmemiş");
+    const nextHomeAssistantStatus = normalizeHomeAssistantStatus(status?.homeAssistant || status);
+    setHomeAssistantStatus(nextHomeAssistantStatus);
+    if (!status.connected && !nextHomeAssistantStatus.connected) throw new Error("DIRIGERA veya Home Assistant henüz bağlanmamış");
     const home = await requestBridge(settings, "/api/home");
     const normalized = normalizeHome(home);
     setDevices(normalized);
@@ -743,7 +947,7 @@ export function HomeControl() {
     }
     setTimeline(normalizeBridgeEvents(eventsPayload, normalized));
     setMode("bridge");
-    setBridgeOnline(true);
+    setBridgeOnline(Boolean(status.connected));
     setLastSync("şimdi");
     return true;
   }, [bridgeSettings]);
@@ -800,6 +1004,17 @@ export function HomeControl() {
     if (failures.length) throw failures[0];
   }
 
+  function changeDeviceAttributes(id: string, attributes: Record<string, unknown>, commit = true) {
+    const previous = devices.find((device) => device.id === id);
+    if (!previous || !previous.online) return;
+    setDevices((current) => current.map((device) => device.id === id ? applyDeviceAttributes(device, attributes) : device));
+    if (!commit) return;
+    sendDeviceAttributes(id, attributes).catch(() => {
+      setDevices((current) => current.map((device) => device.id === id ? previous : device));
+      showToast(`${previous.name} komutu iletilemedi; önceki duruma dönüldü`);
+    });
+  }
+
   function cancelTestOffTimer(deviceId: string) {
     const timer = testOffTimersRef.current.get(deviceId);
     if (timer !== undefined) window.clearTimeout(timer);
@@ -836,7 +1051,7 @@ export function HomeControl() {
         at: new Date().toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" }),
         title: `${device.name} ${next ? "açıldı" : "kapatıldı"}`,
         detail: "Web panelinden elle kontrol edildi",
-        kind: "light",
+        kind: device.type === "camera" ? "camera" : device.type === "light" ? "light" : "system",
       },
       ...current,
     ]);
@@ -958,14 +1173,7 @@ export function HomeControl() {
       current.map((device) => {
         const action = rule.actions.find((item) => item.deviceId === device.id);
         const attributes = action ? mergedActionAttributes(action) : null;
-        return action
-          ? {
-              ...device,
-              ...(typeof attributes?.isOn === "boolean" ? { isOn: attributes.isOn } : {}),
-              ...(typeof attributes?.lightLevel === "number" ? { brightness: attributes.lightLevel } : {}),
-              ...(typeof attributes?.colorTemperature === "number" ? { temperature: attributes.colorTemperature } : {}),
-            }
-          : device;
+        return action && attributes ? applyDeviceAttributes(device, attributes) : device;
       }),
     );
     showToast(`“${rule.name}” test edildi`);
@@ -1031,10 +1239,10 @@ export function HomeControl() {
   const pageTitle: Record<View, { eyebrow: string; title: string; copy: string }> = {
     home: { eyebrow: welcome.date, title: `${welcome.greeting}, Gürkan`, copy: "Evin sakin; her şey planlandığı gibi çalışıyor." },
     rooms: { eyebrow: `${displayedRooms.length} oda`, title: "Odalar", copy: "Her alanı tek dokunuşla kontrol et." },
-    devices: { eyebrow: `${devices.length} ürün`, title: "Cihazlar", copy: "Işık, sensör ve butonların son durumu." },
+    devices: { eyebrow: `${devices.length} ürün`, title: "Cihazlar", copy: "Işık, sensör, iklim ve kamera cihazlarının son durumu." },
     rules: { eyebrow: `${activeRules} kural çalışıyor`, title: "Kurallar", copy: "Evin ne zaman, nasıl davranacağını sen belirle." },
     activity: { eyebrow: "Son 24 saat", title: "Geçmiş", copy: "Evde olan biten her şeyi sakin bir akışta izle." },
-    settings: { eyebrow: "Yerel ve güvenli", title: "Ayarlar", copy: "DIRIGERA bağlantını ve panel tercihlerini yönet." },
+    settings: { eyebrow: "Yerel ve güvenli", title: "Ayarlar", copy: "DIRIGERA ve Home Assistant bağlantılarını yönet." },
   };
 
   const title = pageTitle[view];
@@ -1078,10 +1286,10 @@ export function HomeControl() {
         </nav>
 
         <div className="sidebar-status">
-          <span className={`status-orb ${bridgeOnline || mode === "demo" ? "online" : "offline"}`}><Radio size={15} /></span>
+          <span className={`status-orb ${bridgeOnline || homeAssistantStatus.connected || mode === "demo" ? "online" : "offline"}`}><Radio size={15} /></span>
           <span>
-            <strong>{mode === "demo" ? "Demo evi" : bridgeOnline ? "DIRIGERA bağlı" : "Bağlantı kesildi"}</strong>
-            <small>{mode === "demo" ? "Örnek veriler" : `Son eşitleme ${lastSync}`}</small>
+            <strong>{mode === "demo" ? "Demo evi" : bridgeOnline && homeAssistantStatus.connected ? "Ev sistemleri bağlı" : bridgeOnline ? "DIRIGERA bağlı" : homeAssistantStatus.connected ? "Xiaomi bağlı" : "Bağlantı kesildi"}</strong>
+            <small>{mode === "demo" ? "Örnek veriler" : homeAssistantStatus.connected ? `${homeAssistantStatus.deviceCount} Xiaomi · ${lastSync}` : `Son eşitleme ${lastSync}`}</small>
           </span>
           <button aria-label="Bağlantı ayarları" onClick={() => setConnectionModalOpen(true)}><MoreHorizontal size={18} /></button>
         </div>
@@ -1126,7 +1334,7 @@ export function HomeControl() {
             />
           )}
           {view === "rooms" && (
-            <RoomsView rooms={displayedRooms} devices={devices} toggleLight={toggleLight} toggleRoom={toggleRoom} setBrightness={setBrightness} commitBrightness={commitBrightness} />
+            <RoomsView rooms={displayedRooms} devices={devices} toggleLight={toggleLight} toggleRoom={toggleRoom} setBrightness={setBrightness} commitBrightness={commitBrightness} changeDeviceAttributes={changeDeviceAttributes} />
           )}
           {view === "devices" && (
             <DevicesView
@@ -1139,6 +1347,7 @@ export function HomeControl() {
               toggleLight={toggleLight}
               setBrightness={setBrightness}
               commitBrightness={commitBrightness}
+              changeDeviceAttributes={changeDeviceAttributes}
             />
           )}
           {view === "rules" && (
@@ -1150,7 +1359,20 @@ export function HomeControl() {
               mode={mode}
               bridgeOnline={bridgeOnline}
               bridgeSettings={bridgeSettings}
+              homeAssistantStatus={homeAssistantStatus}
               openConnection={() => setConnectionModalOpen(true)}
+              openHomeAssistant={() => setHomeAssistantModalOpen(true)}
+              disconnectHomeAssistant={async () => {
+                if (!window.confirm("Xiaomi / Home Assistant bağlantısı kaldırılsın mı?")) return;
+                try {
+                  await bridgeFetch("/api/integrations/home-assistant/configure", { method: "DELETE" });
+                  setHomeAssistantStatus(disconnectedHomeAssistant);
+                  setDevices((current) => current.filter((device) => device.provider !== "home-assistant"));
+                  showToast("Home Assistant bağlantısı kaldırıldı");
+                } catch (error) {
+                  showToast(error instanceof Error ? error.message : "Bağlantı kaldırılamadı");
+                }
+              }}
               useDemo={() => {
                 window.localStorage.setItem("yuva-connection-mode", "demo");
                 setMode("demo");
@@ -1220,6 +1442,22 @@ export function HomeControl() {
             setTimeline(initialTimeline);
             setConnectionModalOpen(false);
             showToast("Demo modunda devam ediliyor");
+          }}
+        />
+      )}
+      {homeAssistantModalOpen && (
+        <HomeAssistantModal
+          status={homeAssistantStatus}
+          onClose={() => setHomeAssistantModalOpen(false)}
+          onConnect={async (baseUrl, accessToken) => {
+            const payload = await bridgeFetch("/api/integrations/home-assistant/configure", {
+              method: "POST",
+              body: JSON.stringify({ baseUrl, accessToken }),
+            });
+            setHomeAssistantStatus(normalizeHomeAssistantStatus(payload));
+            await syncBridge();
+            setHomeAssistantModalOpen(false);
+            showToast("Xiaomi cihazları Home Assistant üzerinden bağlandı");
           }}
         />
       )}
@@ -1333,7 +1571,7 @@ function DashboardView({
   );
 }
 
-function RoomsView({ rooms, devices, toggleLight, toggleRoom, setBrightness, commitBrightness }: { rooms: Room[]; devices: SmartDevice[]; toggleLight: (id: string) => void; toggleRoom: (name: string) => void; setBrightness: (id: string, value: number) => void; commitBrightness: (id: string, value: number) => void }) {
+function RoomsView({ rooms, devices, toggleLight, toggleRoom, setBrightness, commitBrightness, changeDeviceAttributes }: { rooms: Room[]; devices: SmartDevice[]; toggleLight: (id: string) => void; toggleRoom: (name: string) => void; setBrightness: (id: string, value: number) => void; commitBrightness: (id: string, value: number) => void; changeDeviceAttributes: (id: string, attributes: Record<string, unknown>, commit?: boolean) => void }) {
   return (
     <div className="room-detail-grid">
       {rooms.map((room) => {
@@ -1343,7 +1581,7 @@ function RoomsView({ rooms, devices, toggleLight, toggleRoom, setBrightness, com
           <section className={`room-detail ${room.color}`} key={room.id}>
             <header><div><span>{roomDevices.length} cihaz</span><h2>{room.name}</h2></div><Switch checked={roomLights.some((light) => light.isOn)} onChange={() => toggleRoom(room.name)} label={`${room.name} toplu anahtar`} /></header>
             <div className="room-device-stack">
-              {roomDevices.map((device) => <DeviceListItem key={device.id} device={device} onToggle={() => toggleLight(device.id)} onBrightness={(value) => setBrightness(device.id, value)} onBrightnessCommit={() => commitBrightness(device.id, device.brightness || 1)} />)}
+              {roomDevices.map((device) => <DeviceListItem key={device.id} device={device} onToggle={() => toggleLight(device.id)} onBrightness={(value) => setBrightness(device.id, value)} onBrightnessCommit={() => commitBrightness(device.id, device.brightness || 1)} onAttributes={(attributes, commit) => changeDeviceAttributes(device.id, attributes, commit)} />)}
             </div>
           </section>
         );
@@ -1352,7 +1590,7 @@ function RoomsView({ rooms, devices, toggleLight, toggleRoom, setBrightness, com
   );
 }
 
-function DevicesView({ devices, allDevices, selectedRoom, setSelectedRoom, search, setSearch, toggleLight, setBrightness, commitBrightness }: { devices: SmartDevice[]; allDevices: SmartDevice[]; selectedRoom: string; setSelectedRoom: (room: string) => void; search: string; setSearch: (search: string) => void; toggleLight: (id: string) => void; setBrightness: (id: string, value: number) => void; commitBrightness: (id: string, value: number) => void }) {
+function DevicesView({ devices, allDevices, selectedRoom, setSelectedRoom, search, setSearch, toggleLight, setBrightness, commitBrightness, changeDeviceAttributes }: { devices: SmartDevice[]; allDevices: SmartDevice[]; selectedRoom: string; setSelectedRoom: (room: string) => void; search: string; setSearch: (search: string) => void; toggleLight: (id: string) => void; setBrightness: (id: string, value: number) => void; commitBrightness: (id: string, value: number) => void; changeDeviceAttributes: (id: string, attributes: Record<string, unknown>, commit?: boolean) => void }) {
   const roomNames = ["Tümü", ...Array.from(new Set(allDevices.map((device) => device.room)))];
   return (
     <section className="panel devices-panel">
@@ -1362,24 +1600,74 @@ function DevicesView({ devices, allDevices, selectedRoom, setSelectedRoom, searc
       </div>
       <div className="devices-table-head"><span>CİHAZ</span><span>DURUM</span><span>PİL / SEVİYE</span><span>KONTROL</span></div>
       <div className="devices-table">
-        {devices.map((device) => <DeviceListItem key={device.id} device={device} onToggle={() => toggleLight(device.id)} onBrightness={(value) => setBrightness(device.id, value)} onBrightnessCommit={() => commitBrightness(device.id, device.brightness || 1)} table />)}
+        {devices.map((device) => <DeviceListItem key={device.id} device={device} onToggle={() => toggleLight(device.id)} onBrightness={(value) => setBrightness(device.id, value)} onBrightnessCommit={() => commitBrightness(device.id, device.brightness || 1)} onAttributes={(attributes, commit) => changeDeviceAttributes(device.id, attributes, commit)} table />)}
         {!devices.length && <EmptyState icon={Search} title="Cihaz bulunamadı" copy="Arama veya oda filtresini değiştirip yeniden dene." />}
       </div>
     </section>
   );
 }
 
-function DeviceListItem({ device, onToggle, onBrightness, onBrightnessCommit, table = false }: { device: SmartDevice; onToggle: () => void; onBrightness: (value: number) => void; onBrightnessCommit: () => void; table?: boolean }) {
+function DeviceListItem({ device, onToggle, onBrightness, onBrightnessCommit, onAttributes, table = false }: { device: SmartDevice; onToggle: () => void; onBrightness: (value: number) => void; onBrightnessCommit: () => void; onAttributes: (attributes: Record<string, unknown>, commit?: boolean) => void; table?: boolean }) {
+  const supportsPower = device.type === "light" || device.type === "airPurifier" || device.type === "dehumidifier" || device.capabilities?.power === true;
+  const supportsPrivacy = device.type === "camera" && (device.capabilities?.privacy === true || device.privacy !== undefined);
+  const status = !device.online
+    ? "Çevrimdışı"
+    : device.type === "motion"
+      ? `Hareket yok${device.lastEvent ? ` · ${device.lastEvent}` : ""}`
+      : device.type === "button"
+        ? `Son basış ${device.lastEvent || "—"}`
+        : device.type === "camera"
+          ? device.lastEvent ? `Son olay ${device.lastEvent}` : "Kamera çevrimiçi"
+          : device.isOn ? "Açık" : "Kapalı";
+  const level = device.type === "light"
+    ? device.isOn ? `%${device.brightness ?? "—"}` : "—"
+    : device.type === "airPurifier"
+      ? device.pm25 !== undefined ? `PM2.5 ${device.pm25}` : device.percentage !== undefined ? `Fan %${device.percentage}` : "—"
+      : device.type === "dehumidifier"
+        ? device.humidity !== undefined ? `%${device.humidity} nem` : "—"
+        : device.type === "camera"
+          ? device.privacy ? "Gizlilik açık" : "Hazır"
+          : device.battery !== undefined ? `Pil %${device.battery}` : "—";
   return (
     <article className={`device-row ${table ? "is-table" : ""} ${device.isOn ? "is-on" : ""}`}>
-      <div className="device-identity"><span className={`device-type-icon ${device.type}`}><DeviceGlyph type={device.type} /></span><span><b>{device.name}</b><small>{device.room} · {device.model}</small></span></div>
-      <div className="device-state"><span className={`online-dot ${device.online ? "" : "offline"}`} />{device.online ? (device.type === "motion" ? `Hareket yok · ${device.lastEvent}` : device.type === "button" ? `Son basış ${device.lastEvent}` : device.isOn ? "Açık" : "Kapalı") : "Çevrimdışı"}</div>
-      <div className="device-level">{device.type === "light" ? <>{device.isOn ? `%${device.brightness}` : "—"}</> : <><BatteryMedium size={17} /> %{device.battery}</>}</div>
+      <div className="device-identity"><span className={`device-type-icon ${device.type}`}><DeviceGlyph type={device.type} /></span><span><b>{device.name}</b><small>{device.room} · {device.model}</small>{device.provider === "home-assistant" && <em className="device-source">XIAOMI · HOME ASSISTANT</em>}</span></div>
+      <div className="device-state"><span className={`online-dot ${device.online ? "" : "offline"}`} />{status}</div>
+      <div className="device-level">{(device.type === "motion" || device.type === "button") && device.battery !== undefined && <BatteryMedium size={17} />}{level}</div>
       <div className="device-control">
-        {device.type === "light" ? <Switch checked={Boolean(device.isOn)} onChange={onToggle} label={`${device.name} anahtarı`} /> : <button className="text-icon-button" aria-label={`${device.name} ayrıntıları`}><ChevronRight size={18} /></button>}
+        {supportsPower ? <Switch checked={Boolean(device.isOn)} onChange={onToggle} label={`${device.name} anahtarı`} /> : supportsPrivacy ? <Switch checked={Boolean(device.privacy)} onChange={() => onAttributes({ privacy: !device.privacy })} label={`${device.name} gizlilik modu`} /> : <button className="text-icon-button" aria-label={`${device.name} ayrıntıları`}><ChevronRight size={18} /></button>}
       </div>
       {device.type === "light" && device.isOn && (
         <div className="device-dimmer"><Sun size={15} /><input type="range" min="1" max="100" value={device.brightness} aria-label={`${device.name} parlaklık`} onChange={(event) => onBrightness(Number(event.target.value))} onPointerUp={onBrightnessCommit} style={{ "--range-progress": `${device.brightness}%` } as React.CSSProperties} /><b>%{device.brightness}</b></div>
+      )}
+      {device.type === "airPurifier" && (
+        <div className="device-secondary-controls climate-controls">
+          <div className="device-metrics">
+            {device.pm25 !== undefined && <span><b>{device.pm25}</b><small>PM2.5</small></span>}
+            {device.pm10 !== undefined && <span><b>{device.pm10}</b><small>PM10</small></span>}
+            {device.filterLife !== undefined && <span><b>%{device.filterLife}</b><small>Filtre</small></span>}
+            {device.ambientTemperature !== undefined && <span><b>{device.ambientTemperature}°</b><small>Sıcaklık</small></span>}
+          </div>
+          {device.capabilities?.presetMode !== false && Boolean(device.availableModes?.length) && <label><span>Çalışma modu</span><select value={device.presetMode || ""} onChange={(event) => onAttributes({ presetMode: event.target.value })}><option value="">Mod seç</option>{device.availableModes?.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select></label>}
+          {(device.capabilities?.percentage === true || device.percentage !== undefined) && <label className="climate-range"><span><b>Fan seviyesi</b><em>%{device.percentage ?? 0}</em></span><input type="range" min="0" max="100" value={device.percentage ?? 0} onChange={(event) => onAttributes({ percentage: Number(event.target.value) }, false)} onPointerUp={(event) => onAttributes({ percentage: Number(event.currentTarget.value) })} style={{ "--range-progress": `${device.percentage ?? 0}%` } as React.CSSProperties} /></label>}
+        </div>
+      )}
+      {device.type === "dehumidifier" && (
+        <div className="device-secondary-controls climate-controls">
+          <div className="device-metrics">
+            {device.humidity !== undefined && <span><b>%{device.humidity}</b><small>Mevcut nem</small></span>}
+            {device.targetHumidity !== undefined && <span><b>%{device.targetHumidity}</b><small>Hedef nem</small></span>}
+            {device.ambientTemperature !== undefined && <span><b>{device.ambientTemperature}°</b><small>Sıcaklık</small></span>}
+            {device.waterTankFull !== undefined && <span className={device.waterTankFull ? "warning" : ""}><b>{device.waterTankFull ? "Dolu" : "Normal"}</b><small>Su haznesi</small></span>}
+          </div>
+          {device.capabilities?.presetMode !== false && Boolean(device.availableModes?.length) && <label><span>Çalışma modu</span><select value={device.presetMode || ""} onChange={(event) => onAttributes({ presetMode: event.target.value })}><option value="">Mod seç</option>{device.availableModes?.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select></label>}
+          {(device.capabilities?.targetHumidity === true || device.targetHumidity !== undefined) && <label className="climate-range"><span><b>Hedef nem</b><em>%{device.targetHumidity ?? 50}</em></span><input type="range" min="30" max="80" step="5" value={device.targetHumidity ?? 50} onChange={(event) => onAttributes({ targetHumidity: Number(event.target.value) }, false)} onPointerUp={(event) => onAttributes({ targetHumidity: Number(event.currentTarget.value) })} style={{ "--range-progress": `${((device.targetHumidity ?? 50) - 30) * 2}%` } as React.CSSProperties} /></label>}
+        </div>
+      )}
+      {device.type === "camera" && (
+        <div className="device-secondary-controls camera-controls">
+          <span className="camera-notice"><Camera size={16} /><span><b>{device.lastEvent ? `Son olay: ${device.lastEvent}` : "Kamera durumu hazır"}</b><small>Bu entegrasyon canlı görüntü sağlamaz; yalnızca desteklenen durum ve gizlilik kontrolleri gösterilir.</small></span></span>
+          {supportsPrivacy && <label><span><b>Gizlilik modu</b><small>Kamera görüntü işlemeyi durdurur.</small></span><Switch checked={Boolean(device.privacy)} onChange={() => onAttributes({ privacy: !device.privacy })} label={`${device.name} gizlilik modu`} /></label>}
+        </div>
       )}
       {device.automatedBy && <span className="automation-note"><WandSparkles size={13} /> {device.automatedBy} tarafından açık</span>}
     </article>
@@ -1422,11 +1710,11 @@ function ActivityView({ timeline }: { timeline: TimelineEvent[] }) {
 }
 
 function TimelineRow({ event }: { event: TimelineEvent }) {
-  const Icon = event.kind === "motion" ? Footprints : event.kind === "button" ? MousePointerClick : event.kind === "rule" ? WandSparkles : event.kind === "system" ? Router : Lightbulb;
+  const Icon = event.kind === "motion" ? Footprints : event.kind === "button" ? MousePointerClick : event.kind === "rule" ? WandSparkles : event.kind === "camera" ? Camera : event.kind === "system" ? Router : Lightbulb;
   return <div className="timeline-row"><time>{event.at}</time><span className={`timeline-icon ${event.kind}`}><Icon size={17} /></span><div><b>{event.title}</b><p>{event.detail}</p></div><button aria-label="Ayrıntılar"><ChevronRight size={17} /></button></div>;
 }
 
-function SettingsView({ mode, bridgeOnline, bridgeSettings, openConnection, useDemo }: { mode: "demo" | "bridge"; bridgeOnline: boolean; bridgeSettings: BridgeSettings; openConnection: () => void; useDemo: () => void }) {
+function SettingsView({ mode, bridgeOnline, bridgeSettings, homeAssistantStatus, openConnection, openHomeAssistant, disconnectHomeAssistant, useDemo }: { mode: "demo" | "bridge"; bridgeOnline: boolean; bridgeSettings: BridgeSettings; homeAssistantStatus: HomeAssistantStatus; openConnection: () => void; openHomeAssistant: () => void; disconnectHomeAssistant: () => void; useDemo: () => void }) {
   return (
     <div className="settings-grid">
       <section className="panel connection-card">
@@ -1434,9 +1722,15 @@ function SettingsView({ mode, bridgeOnline, bridgeSettings, openConnection, useD
         <div className="connection-state"><span className={`large-status ${mode === "demo" || bridgeOnline ? "online" : ""}`}><Wifi size={25} /></span><div><small>AKTİF KAYNAK</small><b>{mode === "demo" ? "Demo evi" : bridgeOnline ? "DIRIGERA · Çevrimiçi" : "DIRIGERA · Ulaşılamıyor"}</b><p>{mode === "demo" ? "Arayüz örnek cihazlarla çalışıyor." : bridgeSettings.url}</p></div></div>
         <div className="settings-actions"><button className="primary-button" onClick={openConnection}><Router size={17} /> {mode === "bridge" ? "Bağlantıyı düzenle" : "Gerçek eve bağlan"}</button>{mode === "bridge" && <button className="secondary-button" onClick={useDemo}>Demo moduna dön</button>}</div>
       </section>
+      <section className="panel xiaomi-card">
+        <div className="settings-card-title"><span className={homeAssistantStatus.connected ? "success" : ""}><Fan size={22} /></span><div><h2>Xiaomi · Home Assistant</h2><p>Hava, nem, ampul ve kamera durumlarını tek yerde yönet.</p></div></div>
+        <div className="connection-state compact"><span className={`large-status ${homeAssistantStatus.connected ? "online" : ""}`}><House size={23} /></span><div><small>ENTEGRASYON</small><b>{homeAssistantStatus.connected ? "Bağlı · Canlı" : homeAssistantStatus.configured ? "Yapılandırıldı · Ulaşılamıyor" : "Henüz bağlanmadı"}</b><p>{homeAssistantStatus.connected ? `${homeAssistantStatus.deviceCount} Xiaomi cihazı eşitlendi` : homeAssistantStatus.baseUrl || "Home Assistant 8124 portunda hazırlanacak."}</p></div></div>
+        {homeAssistantStatus.lastError && <div className="integration-error"><WifiOff size={15} /><span>{homeAssistantStatus.lastError}</span></div>}
+        <div className="settings-actions"><button className="primary-button" onClick={openHomeAssistant}><House size={17} /> {homeAssistantStatus.configured ? "Bağlantıyı düzenle" : "Xiaomi cihazlarını bağla"}</button>{homeAssistantStatus.configured && <button className="secondary-button danger-outline" onClick={disconnectHomeAssistant}>Bağlantıyı kaldır</button>}</div>
+      </section>
       <section className="panel preference-card"><div className="settings-card-title"><span><Bell size={21} /></span><div><h2>Bildirimler</h2><p>Önemli durumları öne çıkar.</p></div></div><SettingRow title="Düşük pil uyarısı" copy="Pil %20 altına indiğinde" checked /><SettingRow title="Cihaz çevrimdışı" copy="10 dakikadan uzun sürerse" checked /><SettingRow title="Kural hataları" copy="Bir eylem tamamlanamazsa" checked /></section>
       <section className="panel preference-card"><div className="settings-card-title"><span><Clock3 size={21} /></span><div><h2>Ev ayarları</h2><p>Kurallarda kullanılan temel değerler.</p></div></div><div className="setting-value"><span><b>Saat dilimi</b><small>Gün doğumu ve saatli kurallar</small></span><button>Europe/Istanbul <ChevronRight size={16} /></button></div><div className="setting-value"><span><b>Düşük pil eşiği</b><small>Tüm pilli cihazlar için</small></span><button>%20 <ChevronRight size={16} /></button></div></section>
-      <section className="security-note"><ShieldCheck size={24} /><div><b>Yerel kontrol, evde kalan veri</b><p>Hub erişim anahtarı web paneline gönderilmez; yerel köprüde saklanır. Panel yalnızca senin oluşturduğun bağlantı anahtarıyla konuşur.</p></div></section>
+      <section className="security-note"><ShieldCheck size={24} /><div><b>Yerel kontrol, evde kalan veri</b><p>DIRIGERA ve Home Assistant erişim bilgileri yerel köprüde saklanır. Home Assistant tokenı yalnızca bağlantı sırasında köprüye gönderilir; tarayıcı depolamasına veya GitHub’a yazılmaz.</p></div></section>
     </div>
   );
 }
@@ -1472,6 +1766,20 @@ function stateAttributesForDevice(device: SmartDevice | undefined): DeviceStateA
   } else if (device.type === "motion") {
     attributes.unshift("isDetected");
     if (device.battery !== undefined) attributes.push("batteryPercentage");
+  } else if (device.type === "airPurifier") {
+    if (device.isOn !== undefined) attributes.unshift("isOn");
+    if (device.pm25 !== undefined) attributes.push("pm25");
+    if (device.pm10 !== undefined) attributes.push("pm10");
+    if (device.ambientTemperature !== undefined) attributes.push("temperature");
+    if (device.humidity !== undefined) attributes.push("humidity");
+    if (device.filterLife !== undefined) attributes.push("filterLife");
+    if (device.percentage !== undefined) attributes.push("percentage");
+  } else if (device.type === "dehumidifier") {
+    if (device.isOn !== undefined) attributes.unshift("isOn");
+    if (device.humidity !== undefined) attributes.push("humidity");
+    if (device.targetHumidity !== undefined) attributes.push("targetHumidity");
+    if (device.ambientTemperature !== undefined) attributes.push("temperature");
+    if (device.waterTankFull !== undefined) attributes.push("waterTankFull");
   } else if (device.battery !== undefined) {
     attributes.unshift("batteryPercentage");
   }
@@ -1479,14 +1787,27 @@ function stateAttributesForDevice(device: SmartDevice | undefined): DeviceStateA
 }
 
 function defaultStateValue(attribute: DeviceStateAttribute): boolean | number {
-  if (numericStateAttributes.has(attribute)) return attribute === "colorTemperature" ? 2700 : 50;
+  if (numericStateAttributes.has(attribute)) {
+    if (attribute === "colorTemperature") return 2700;
+    if (attribute === "temperature") return 22;
+    if (attribute === "pm25" || attribute === "pm10") return 25;
+    return 50;
+  }
   return true;
 }
 
 function stateValueLabels(attribute: DeviceStateAttribute) {
   if (attribute === "isOn") return ["Açık", "Kapalı"];
   if (attribute === "isDetected") return ["Algılandı", "Algılanmadı"];
+  if (attribute === "waterTankFull") return ["Dolu", "Normal"];
   return ["Çevrimiçi", "Çevrimdışı"];
+}
+
+function numericConditionRange(attribute: DeviceStateAttribute) {
+  if (attribute === "colorTemperature") return { min: 1500, max: 6500 };
+  if (attribute === "temperature") return { min: -20, max: 60 };
+  if (attribute === "pm25" || attribute === "pm10") return { min: 0, max: 1000 };
+  return { min: 0, max: 100 };
 }
 
 function OptionalSetting({ enabled, title, copy, onToggle, children }: { enabled: boolean; title: string; copy: string; onToggle: () => void; children?: React.ReactNode }) {
@@ -1505,6 +1826,10 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
   const sensors = devices.filter((device) => device.type === "motion");
   const buttons = devices.filter((device) => device.type === "button");
   const lights = devices.filter((device) => device.type === "light");
+  const controllableDevices = devices.filter((device) =>
+    ["light", "airPurifier", "dehumidifier"].includes(device.type) &&
+    (device.isOn !== undefined || device.capabilities?.power === true),
+  );
   const [generatedId] = useState(() => `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`);
   const [step, setStep] = useState(1);
   const [saving, setSaving] = useState(false);
@@ -1566,15 +1891,16 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
   );
 
   const createBulkAction = (deviceId: string): ActionEditorState => {
-    const device = lights.find((light) => light.id === deviceId);
+    const device = controllableDevices.find((item) => item.id === deviceId);
+    const isLight = device?.type === "light";
     return {
       deviceId,
       isOn: bulkOn,
-      brightnessEnabled: bulkOn && bulkBrightnessEnabled && device?.brightness !== undefined,
+      brightnessEnabled: Boolean(isLight && bulkOn && bulkBrightnessEnabled && device?.brightness !== undefined),
       brightness: bulkBrightness,
-      temperatureEnabled: bulkOn && bulkTemperatureEnabled && device?.temperature !== undefined,
+      temperatureEnabled: Boolean(isLight && bulkOn && bulkTemperatureEnabled && device?.temperature !== undefined),
       temperature: bulkTemperature,
-      transitionEnabled: bulkTransitionEnabled,
+      transitionEnabled: Boolean(isLight && bulkTransitionEnabled),
       transitionSeconds: bulkTransitionSeconds,
       autoOffEnabled: bulkOn && bulkAutoOffEnabled,
       autoOffMinutes: bulkAutoOffMinutes,
@@ -1616,14 +1942,14 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
     });
   }
 
-  function selectRoomLights(room: string) {
-    const roomLights = lights.filter((light) => light.room === room);
-    const roomIds = new Set(roomLights.map((light) => light.id));
+  function selectRoomTargets(room: string) {
+    const roomTargets = controllableDevices.filter((device) => device.room === room);
+    const roomIds = new Set(roomTargets.map((device) => device.id));
     setActionEditors((current) => {
-      const allSelected = roomLights.length > 0 && roomLights.every((light) => current.some((action) => action.deviceId === light.id));
+      const allSelected = roomTargets.length > 0 && roomTargets.every((device) => current.some((action) => action.deviceId === device.id));
       if (allSelected) return current.filter((action) => !roomIds.has(action.deviceId));
       const existingIds = new Set(current.map((action) => action.deviceId));
-      const additions = roomLights.filter((light) => !existingIds.has(light.id)).map((light) => createBulkAction(light.id));
+      const additions = roomTargets.filter((device) => !existingIds.has(device.id)).map((device) => createBulkAction(device.id));
       return [...current, ...additions].slice(0, 32);
     });
   }
@@ -1632,9 +1958,19 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
     setActionEditors((current) => current.map((action) => action.deviceId === deviceId ? { ...action, ...patch } : action));
   }
 
+  function updateActionAttribute(deviceId: string, attribute: string, value: unknown) {
+    setActionEditors((current) => current.map((action) => {
+      if (action.deviceId !== deviceId) return action;
+      const passthroughAttributes = { ...(action.passthroughAttributes || {}) };
+      if (value === undefined || value === "") delete passthroughAttributes[attribute];
+      else passthroughAttributes[attribute] = value;
+      return { ...action, passthroughAttributes: Object.keys(passthroughAttributes).length ? passthroughAttributes : undefined };
+    }));
+  }
+
   function applyBulkSettings() {
     setActionEditors((current) => current.map((action) =>
-      lights.some((light) => light.id === action.deviceId)
+      controllableDevices.some((device) => device.id === action.deviceId)
         ? { ...action, ...createBulkAction(action.deviceId) }
         : action,
     ));
@@ -1742,19 +2078,20 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
       })) errors.push("Bir cihaz koşulunda, seçilen cihazın desteklemediği bir özellik var.");
       if (deviceConditionsEnabled && deviceConditions.some((condition) => {
         if (typeof condition.value !== "number" || !Number.isFinite(condition.value)) return numericStateAttributes.has(condition.attribute);
-        if (condition.attribute === "colorTemperature") return condition.value < 1500 || condition.value > 6500;
-        if (condition.attribute === "lightLevel" || condition.attribute === "batteryPercentage") return condition.value < 0 || condition.value > 100;
-        return false;
-      })) errors.push("Cihaz koşullarında parlaklık/pil 0–100, renk sıcaklığı 1500K–6500K arasında olmalı.");
+        const range = numericConditionRange(condition.attribute);
+        return condition.value < range.min || condition.value > range.max;
+      })) errors.push("Cihaz koşullarındaki değer, seçilen özelliğin desteklediği aralıkta olmalı.");
       if (cooldownEnabled && (!Number.isFinite(cooldownMinutes) || cooldownMinutes <= 0 || cooldownMinutes > 1440)) errors.push("Bekleme süresi 1–1440 dakika arasında olmalı.");
     }
     if (targetStep === 4) {
-      if (actionEditors.length === 0) errors.push("Kuralın çalıştıracağı en az bir ışık seçmelisin.");
+      if (actionEditors.length === 0) errors.push("Kuralın çalıştıracağı en az bir cihaz seçmelisin.");
       if (actionEditors.length > 32) errors.push("Bir kurala en fazla 32 cihaz ekleyebilirsin.");
       if (actionEditors.some((action) => action.isOn !== false && action.brightnessEnabled && (!Number.isFinite(action.brightness) || action.brightness < 1 || action.brightness > 100))) errors.push("Parlaklık değerleri %1–%100 arasında olmalı.");
       if (actionEditors.some((action) => action.isOn !== false && action.temperatureEnabled && (!Number.isFinite(action.temperature) || action.temperature < 1500 || action.temperature > 6500))) errors.push("Renk sıcaklığı 1500K–6500K arasında olmalı.");
       if (actionEditors.some((action) => action.transitionEnabled && (!Number.isFinite(action.transitionSeconds) || action.transitionSeconds < 0 || action.transitionSeconds > 600))) errors.push("Geçiş süresi 0–600 saniye arasında olmalı.");
       if (actionEditors.some((action) => action.isOn && action.autoOffEnabled && (!Number.isFinite(action.autoOffMinutes) || action.autoOffMinutes <= 0 || action.autoOffMinutes > 1440))) errors.push("Otomatik kapanma süresi 1–1440 dakika arasında olmalı.");
+      if (actionEditors.some((action) => typeof action.passthroughAttributes?.percentage === "number" && (action.passthroughAttributes.percentage < 0 || action.passthroughAttributes.percentage > 100))) errors.push("Fan seviyesi %0–%100 arasında olmalı.");
+      if (actionEditors.some((action) => typeof action.passthroughAttributes?.targetHumidity === "number" && (action.passthroughAttributes.targetHumidity < 30 || action.passthroughAttributes.targetHumidity > 80))) errors.push("Hedef nem %30–%80 arasında olmalı.");
     }
     return errors;
   }
@@ -1839,13 +2176,14 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
                       const device = devices.find((item) => item.id === condition.deviceId);
                       const attributes = stateAttributesForDevice(device);
                       const isNumeric = numericStateAttributes.has(condition.attribute);
+                      const numericRange = numericConditionRange(condition.attribute);
                       const [trueLabel, falseLabel] = stateValueLabels(condition.attribute);
                       return <article className="device-condition-row" key={condition.editorId}>
                         <span className="condition-index">VE {index + 1}</span>
                         <label><span>Cihaz</span><select value={condition.deviceId} onChange={(event) => changeConditionDevice(condition, event.target.value)}><option value="">Cihaz seç</option>{devices.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.room}</option>)}</select></label>
                         <label><span>Özellik</span><select value={condition.attribute} onChange={(event) => changeConditionAttribute(condition, event.target.value as DeviceStateAttribute)}>{attributes.map((attribute) => <option key={attribute} value={attribute}>{stateAttributeLabels[attribute]}</option>)}</select></label>
                         <label><span>Karşılaştırma</span><select value={condition.operator} onChange={(event) => updateDeviceCondition(condition.editorId, { operator: event.target.value as DeviceStateOperator })}>{(isNumeric ? Object.keys(stateOperatorLabels) : ["equals", "notEquals"]).map((operator) => <option key={operator} value={operator}>{stateOperatorLabels[operator as DeviceStateOperator]}</option>)}</select></label>
-                        <label><span>Değer</span>{isNumeric ? <input type="number" min={condition.attribute === "colorTemperature" ? 1500 : 0} max={condition.attribute === "colorTemperature" ? 6500 : 100} value={condition.value as number} onChange={(event) => updateDeviceCondition(condition.editorId, { value: Number(event.target.value) })} /> : <select value={String(condition.value)} onChange={(event) => updateDeviceCondition(condition.editorId, { value: event.target.value === "true" })}><option value="true">{trueLabel}</option><option value="false">{falseLabel}</option></select>}</label>
+                        <label><span>Değer</span>{isNumeric ? <input type="number" min={numericRange.min} max={numericRange.max} value={condition.value as number} onChange={(event) => updateDeviceCondition(condition.editorId, { value: Number(event.target.value) })} /> : <select value={String(condition.value)} onChange={(event) => updateDeviceCondition(condition.editorId, { value: event.target.value === "true" })}><option value="true">{trueLabel}</option><option value="false">{falseLabel}</option></select>}</label>
                         <button type="button" aria-label={`${index + 1}. koşulu sil`} onClick={() => setDeviceConditions((current) => current.filter((item) => item.editorId !== condition.editorId))}><Trash2 size={16} /></button>
                       </article>;
                     })}
@@ -1856,18 +2194,18 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
             </>}
 
             {step === 4 && <>
-              <div className="builder-section-heading"><span className="soft-icon"><Lightbulb size={19} /></span><div><h3>Bir veya daha fazla ışığı yönet</h3><p>Önce hedefleri seç, toplu ayarı uygula; gerekirse her ışığı ayrı özelleştir.</p></div></div>
+              <div className="builder-section-heading"><span className="soft-icon"><SlidersHorizontal size={19} /></span><div><h3>Bir veya daha fazla cihazı yönet</h3><p>Işıkları, hava temizleyiciyi ve nem cihazını aynı yerel kuralda çalıştırabilirsin.</p></div></div>
               <section className="target-picker">
-                <div className="target-picker-head"><span><b>Hedef cihazlar</b><small>{actionEditors.length} ışık seçili · en az bir seçim gerekli</small></span><button type="button" onClick={selectAllLights}>{actionEditors.length === lights.length && lights.length ? "Seçimi temizle" : "Tüm ışıkları seç"}</button></div>
-                <div className="target-room-actions"><span>Odaya göre:</span>{Array.from(new Set(lights.map((light) => light.room))).map((room) => { const roomLights = lights.filter((light) => light.room === room); const roomSelected = roomLights.length > 0 && roomLights.every((light) => actionEditors.some((action) => action.deviceId === light.id)); return <button type="button" key={room} className={roomSelected ? "selected" : ""} onClick={() => selectRoomLights(room)}>{room} <small>{roomLights.length}</small></button>; })}</div>
-                <div className="target-device-grid">{lights.map((light) => {
-                  const selected = actionEditors.some((action) => action.deviceId === light.id);
-                  return <button type="button" key={light.id} className={selected ? "selected" : ""} onClick={() => toggleActionDevice(light.id)}><span className="target-check">{selected && <Check size={14} />}</span><span><b>{light.name}</b><small>{light.room} · {light.online ? "çevrimiçi" : "çevrimdışı"}</small></span></button>;
+                <div className="target-picker-head"><span><b>Hedef cihazlar</b><small>{actionEditors.length} cihaz seçili · en az bir seçim gerekli</small></span><button type="button" onClick={selectAllLights}>{lights.length > 0 && lights.every((light) => actionEditors.some((action) => action.deviceId === light.id)) ? "Işık seçimini temizle" : "Tüm ışıkları seç"}</button></div>
+                <div className="target-room-actions"><span>Odaya göre:</span>{Array.from(new Set(controllableDevices.map((device) => device.room))).map((room) => { const roomTargets = controllableDevices.filter((device) => device.room === room); const roomSelected = roomTargets.length > 0 && roomTargets.every((device) => actionEditors.some((action) => action.deviceId === device.id)); return <button type="button" key={room} className={roomSelected ? "selected" : ""} onClick={() => selectRoomTargets(room)}>{room} <small>{roomTargets.length}</small></button>; })}</div>
+                <div className="target-device-grid">{controllableDevices.map((device) => {
+                  const selected = actionEditors.some((action) => action.deviceId === device.id);
+                  return <button type="button" key={device.id} className={selected ? "selected" : ""} onClick={() => toggleActionDevice(device.id)}><span className="target-check">{selected && <Check size={14} />}</span><span className={`target-device-glyph ${device.type}`}><DeviceGlyph type={device.type} size={15} /></span><span><b>{device.name}</b><small>{device.room} · {device.online ? "çevrimiçi" : "çevrimdışı"}</small></span></button>;
                 })}</div>
-                {!lights.length && <div className="builder-empty"><Lightbulb size={20} /><span>Kontrol edilebilir bir ışık bulunamadı.</span></div>}
+                {!controllableDevices.length && <div className="builder-empty"><SlidersHorizontal size={20} /><span>Kontrol edilebilir bir cihaz bulunamadı.</span></div>}
               </section>
               <section className="bulk-action-card">
-                <div className="bulk-action-title"><span><b>Toplu eylem ayarı</b><small>Parlaklık ve sıcaklık yalnızca destekleyen ışıklara uygulanır; kartlarda ayrı ayrı değiştirebilirsin.</small></span><div className="segmented"><button type="button" className={bulkOn ? "selected" : ""} onClick={() => setBulkOn(true)}>Aç</button><button type="button" className={!bulkOn ? "selected" : ""} onClick={() => setBulkOn(false)}>Kapat</button></div></div>
+                <div className="bulk-action-title"><span><b>Toplu eylem ayarı</b><small>Aç/kapat tüm seçili cihazlara; parlaklık, sıcaklık ve geçiş yalnızca destekleyen ışıklara uygulanır.</small></span><div className="segmented"><button type="button" className={bulkOn ? "selected" : ""} onClick={() => setBulkOn(true)}>Aç</button><button type="button" className={!bulkOn ? "selected" : ""} onClick={() => setBulkOn(false)}>Kapat</button></div></div>
                 <div className="bulk-options">
                   <label className={!bulkOn ? "is-disabled" : ""}><input type="checkbox" checked={bulkOn && bulkBrightnessEnabled} disabled={!bulkOn} onChange={(event) => setBulkBrightnessEnabled(event.target.checked)} /><span>Parlaklık</span>{bulkOn && bulkBrightnessEnabled && <input type="number" min="1" max="100" value={bulkBrightness} onChange={(event) => setBulkBrightness(Number(event.target.value))} />}{bulkOn && bulkBrightnessEnabled && <em>%</em>}</label>
                   <label className={!bulkOn ? "is-disabled" : ""}><input type="checkbox" checked={bulkOn && bulkTemperatureEnabled} disabled={!bulkOn} onChange={(event) => setBulkTemperatureEnabled(event.target.checked)} /><span>Renk sıcaklığı</span>{bulkOn && bulkTemperatureEnabled && <input type="number" min="1500" max="6500" step="100" value={bulkTemperature} onChange={(event) => setBulkTemperature(Number(event.target.value))} />}{bulkOn && bulkTemperatureEnabled && <em>K</em>}</label>
@@ -1880,17 +2218,19 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
                 {actionEditors.map((action) => {
                   const device = devices.find((item) => item.id === action.deviceId);
                   return <article className="device-action-card" key={action.deviceId}>
-                    <header><span className="device-type-icon light"><Lightbulb size={18} /></span><span><b>{device?.name || "Bilinmeyen ışık"}</b><small>{device?.room || "Odasız"} · bu cihaza özel ayarlar</small></span><button type="button" aria-label={`${device?.name || "Işık"} eylemini kaldır`} onClick={() => toggleActionDevice(action.deviceId)}><X size={16} /></button></header>
+                    <header><span className={`device-type-icon ${device?.type || "light"}`}><DeviceGlyph type={device?.type || "light"} size={18} /></span><span><b>{device?.name || "Bilinmeyen cihaz"}</b><small>{device?.room || "Odasız"} · bu cihaza özel ayarlar</small></span><button type="button" aria-label={`${device?.name || "Cihaz"} eylemini kaldır`} onClick={() => toggleActionDevice(action.deviceId)}><X size={16} /></button></header>
                     {!device && <p className="action-advanced-note">Bu hedef mevcut panel cihaz listesinde görünmüyor. Eylem birebir korunur; istersen kartı kaldırabilirsin.</p>}
                     <div className="device-action-mode segmented three"><button type="button" className={action.isOn === true ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: true })}>Aç</button><button type="button" className={action.isOn === false ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: false })}>Kapat</button><button type="button" className={action.isOn === undefined ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: undefined, autoOffEnabled: false })}>Durumu koru</button></div>
-                    {action.passthroughAttributes && <p className="action-advanced-note">{Object.keys(action.passthroughAttributes).length} gelişmiş DIRIGERA özniteliği değiştirilmeden korunacak.</p>}
+                    {action.passthroughAttributes && !["airPurifier", "dehumidifier"].includes(device?.type || "") && <p className="action-advanced-note">{Object.keys(action.passthroughAttributes).length} gelişmiş cihaz özniteliği değiştirilmeden korunacak.</p>}
                     <div className="device-action-options">
                       {action.isOn !== false && (device?.brightness !== undefined || action.brightnessEnabled) && <OptionalSetting enabled={action.brightnessEnabled} title="Parlaklık" copy="Seçilmezse mevcut parlaklık korunur." onToggle={() => updateAction(action.deviceId, { brightnessEnabled: !action.brightnessEnabled })}><label className="range-field"><span><b>Parlaklık</b><em>%{action.brightness}</em></span><input type="range" min="1" max="100" value={action.brightness} onChange={(event) => updateAction(action.deviceId, { brightness: Number(event.target.value) })} style={{ "--range-progress": `${action.brightness}%` } as React.CSSProperties} /></label></OptionalSetting>}
                       {action.isOn !== false && (device?.temperature !== undefined || action.temperatureEnabled) && <OptionalSetting enabled={action.temperatureEnabled} title="Renk sıcaklığı" copy="Seçilmezse mevcut renk sıcaklığı korunur." onToggle={() => updateAction(action.deviceId, { temperatureEnabled: !action.temperatureEnabled })}><label className="range-field temperature"><span><b>Sıcaklık</b><em>{action.temperature}K</em></span><div><Moon size={15} /><input type="range" min="1500" max="6500" step="100" value={action.temperature} onChange={(event) => updateAction(action.deviceId, { temperature: Number(event.target.value) })} style={{ "--range-progress": `${((action.temperature - 1500) / 5000) * 100}%` } as React.CSSProperties} /><Sun size={15} /></div></label></OptionalSetting>}
-                      <OptionalSetting enabled={action.transitionEnabled} title="Yumuşak geçiş" copy="Komutu aniden değil, seçilen sürede uygula." onToggle={() => updateAction(action.deviceId, { transitionEnabled: !action.transitionEnabled })}><label className="field compact-number"><span>Geçiş süresi</span><div><input type="number" min="0" max="600" value={action.transitionSeconds} onChange={(event) => updateAction(action.deviceId, { transitionSeconds: Number(event.target.value) })} /><em>saniye</em></div></label></OptionalSetting>
-                      {action.isOn && <OptionalSetting enabled={action.autoOffEnabled} title="Otomatik kapat" copy="Bu ışığı açıldıktan sonra otomatik kapat." onToggle={() => updateAction(action.deviceId, { autoOffEnabled: !action.autoOffEnabled })}><label className="field compact-number"><span>Açık kalma süresi</span><div><input type="number" min="1" max="1440" value={action.autoOffMinutes} onChange={(event) => updateAction(action.deviceId, { autoOffMinutes: Number(event.target.value) })} /><em>dakika</em></div></label></OptionalSetting>}
+                      {(device?.type === "light" || !device) && <OptionalSetting enabled={action.transitionEnabled} title="Yumuşak geçiş" copy="Komutu aniden değil, seçilen sürede uygula." onToggle={() => updateAction(action.deviceId, { transitionEnabled: !action.transitionEnabled })}><label className="field compact-number"><span>Geçiş süresi</span><div><input type="number" min="0" max="600" value={action.transitionSeconds} onChange={(event) => updateAction(action.deviceId, { transitionSeconds: Number(event.target.value) })} /><em>saniye</em></div></label></OptionalSetting>}
+                      {action.isOn && <OptionalSetting enabled={action.autoOffEnabled} title="Otomatik kapat" copy="Cihazı açıldıktan sonra seçilen sürede kapat." onToggle={() => updateAction(action.deviceId, { autoOffEnabled: !action.autoOffEnabled })}><label className="field compact-number"><span>Açık kalma süresi</span><div><input type="number" min="1" max="1440" value={action.autoOffMinutes} onChange={(event) => updateAction(action.deviceId, { autoOffMinutes: Number(event.target.value) })} /><em>dakika</em></div></label></OptionalSetting>}
+                      {device?.type === "airPurifier" && action.isOn !== false && <section className="action-attribute-group"><span><Fan size={16} /><b>Hava temizleyici ayarları</b></span>{Boolean(device.availableModes?.length) && <label className="field"><span>Çalışma modu</span><select value={String(action.passthroughAttributes?.presetMode || "")} onChange={(event) => updateActionAttribute(action.deviceId, "presetMode", event.target.value)}><option value="">Mevcut modu koru</option>{device.availableModes?.map((mode) => <option value={mode} key={mode}>{mode}</option>)}</select></label>}{(device.capabilities?.percentage === true || device.percentage !== undefined) && <label className="range-field"><span><b>Fan seviyesi</b><em>%{Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)}</em></span><input type="range" min="0" max="100" value={Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)} onChange={(event) => updateActionAttribute(action.deviceId, "percentage", Number(event.target.value))} style={{ "--range-progress": `${Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)}%` } as React.CSSProperties} /></label>}</section>}
+                      {device?.type === "dehumidifier" && action.isOn !== false && <section className="action-attribute-group"><span><Droplets size={16} /><b>Nem cihazı ayarları</b></span>{Boolean(device.availableModes?.length) && <label className="field"><span>Çalışma modu</span><select value={String(action.passthroughAttributes?.presetMode || "")} onChange={(event) => updateActionAttribute(action.deviceId, "presetMode", event.target.value)}><option value="">Mevcut modu koru</option>{device.availableModes?.map((mode) => <option value={mode} key={mode}>{mode}</option>)}</select></label>}{(device.capabilities?.targetHumidity === true || device.targetHumidity !== undefined) && <label className="range-field"><span><b>Hedef nem</b><em>%{Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50)}</em></span><input type="range" min="30" max="80" step="5" value={Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50)} onChange={(event) => updateActionAttribute(action.deviceId, "targetHumidity", Number(event.target.value))} style={{ "--range-progress": `${(Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50) - 30) * 2}%` } as React.CSSProperties} /></label>}</section>}
                     </div>
-                    {action.isOn === false && <p className="action-off-note">Kapatma eyleminde parlaklık, renk sıcaklığı ve otomatik kapanma gönderilmez. İstersen yalnızca geçiş süresi ekleyebilirsin.</p>}
+                    {action.isOn === false && <p className="action-off-note">Cihaz kapatılır; daha önce kaydedilmiş gelişmiş öznitelikler değiştirilmeden korunur.</p>}
                   </article>;
                 })}
               </div>
@@ -1901,7 +2241,7 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
               <div className="review-stack">
                 <section><span className="review-number">1</span><div><small>TETİKLEYİCİ</small><b>{triggerSummary}</b></div><button type="button" onClick={() => setStep(2)}>Düzenle</button></section>
                 <section><span className="review-number">2</span><div><small>KOŞULLAR</small><b>{!daysEnabled && !timeWindowEnabled && !cooldownEnabled && !deviceConditionsEnabled ? "Ek koşul yok · her uygun tetiklemede çalışır" : [daysEnabled ? `${days.length} gün` : null, timeWindowEnabled ? `${startTime}–${endTime}` : null, deviceConditionsEnabled ? `${deviceConditions.length} cihaz durumu` : null, cooldownEnabled ? `${cooldownMinutes} dk bekleme` : null].filter(Boolean).join(" · ")}</b></div><button type="button" onClick={() => setStep(3)}>Düzenle</button></section>
-                <section><span className="review-number">3</span><div><small>EYLEMLER</small><b>{actions.length} ışık yönetilecek</b><ul>{actions.map((action) => { const device = devices.find((item) => item.id === action.deviceId); return <li key={action.deviceId}>{device?.name || "Işık"}: {actionSettingsSummary(action)}</li>; })}</ul></div><button type="button" onClick={() => setStep(4)}>Düzenle</button></section>
+                <section><span className="review-number">3</span><div><small>EYLEMLER</small><b>{actions.length} cihaz yönetilecek</b><ul>{actions.map((action) => { const device = devices.find((item) => item.id === action.deviceId); return <li key={action.deviceId}>{device?.name || "Cihaz"}: {actionSettingsSummary(action)}</li>; })}</ul></div><button type="button" onClick={() => setStep(4)}>Düzenle</button></section>
               </div>
               <div className={`review-status ${allErrors.length ? "has-errors" : "is-ready"}`}>{allErrors.length ? <><Info size={18} /><div><b>Kural henüz kaydedilemiyor</b><p>{allErrors[0]}</p></div></> : <><Check size={18} /><div><b>Kural hazır</b><p>{enabled ? "Kaydettiğinde hemen etkinleşecek." : "Duraklatılmış olarak kaydedilecek."}</p></div></>}</div>
               <pre className="json-preview" aria-label="Kaydedilecek kural seçenekleri">{JSON.stringify(draft, null, 2)}</pre>
@@ -1913,6 +2253,43 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
         </div>
         <footer><button type="button" className="secondary-button" disabled={saving} onClick={step === 1 ? onClose : () => setStep((current) => current - 1)}>{step === 1 ? "Vazgeç" : <><ArrowLeft size={16} /> Geri</>}</button>{step < 5 ? <button type="button" className="primary-button" disabled={currentErrors.length > 0 || saving} onClick={() => setStep((current) => current + 1)}>Devam <ArrowRight size={16} /></button> : <button type="button" className="primary-button" onClick={submitRule} disabled={allErrors.length > 0 || saving}><Save size={16} /> {saving ? "Kaydediliyor…" : initialRule ? "Değişiklikleri kaydet" : "Kuralı kaydet"}</button>}</footer>
       </div>
+    </div>
+  );
+}
+
+function HomeAssistantModal({ status, onClose, onConnect }: { status: HomeAssistantStatus; onClose: () => void; onConnect: (baseUrl: string, accessToken: string) => Promise<void> }) {
+  const [baseUrl, setBaseUrl] = useState(status.baseUrl || "http://127.0.0.1:8124");
+  const [accessToken, setAccessToken] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setLoading(true);
+    setError(null);
+    try {
+      await onConnect(baseUrl.trim(), accessToken.trim());
+      setAccessToken("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Home Assistant bağlantısı kurulamadı");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="modal-layer" role="dialog" aria-modal="true" aria-labelledby="home-assistant-title">
+      <button className="modal-scrim" aria-label="Kapat" onClick={onClose} />
+      <form className="connection-modal ha-modal" onSubmit={submit} autoComplete="off">
+        <header><span className="connection-hero-icon xiaomi"><Fan size={25} /></span><button type="button" aria-label="Kapat" onClick={onClose}><X size={20} /></button></header>
+        <span className="eyebrow">XIAOMI · YEREL ENTEGRASYON</span><h2 id="home-assistant-title">Xiaomi cihazlarını ekle.</h2><p>Home Assistant, Xiaomi Home hesabındaki desteklenen cihazları Yuva köprüsüne güvenli biçimde aktarır.</p>
+        <label className="field"><span>Home Assistant adresi</span><div className="input-with-icon"><House size={17} /><input inputMode="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="http://127.0.0.1:8124" /></div><small>Bu bilgisayardaki kurulum için varsayılan adresi değiştirmene gerek yok.</small></label>
+        <label className="field"><span>Uzun ömürlü erişim tokenı</span><div className="input-with-icon"><ShieldCheck size={17} /><input type="password" name="home-assistant-token" value={accessToken} onChange={(event) => setAccessToken(event.target.value)} placeholder="Home Assistant profilinden oluşturduğun token" autoComplete="new-password" /></div><small>Home Assistant profilinin en altındaki “Long-lived access tokens” bölümünden oluştur. Token tarayıcıda saklanmaz.</small></label>
+        {error && <div className="form-error"><WifiOff size={17} />{error}</div>}
+        <div className="integration-scope"><span><Fan size={16} /> Hava temizleyici</span><span><Droplets size={16} /> Nem cihazı</span><span><Lightbulb size={16} /> Ampul</span><span><Camera size={16} /> Kamera durumu</span></div>
+        <div className="camera-limit-note"><Camera size={16} /><p><b>Kamera için canlı yayın vaat edilmez.</b> C701 yalnızca Home Assistant’ın sunduğu durum, olay ve gizlilik kontrolleriyle gösterilir.</p></div>
+        <button className="primary-button wide" type="submit" disabled={loading || !baseUrl.trim() || !accessToken.trim()}>{loading ? <><RefreshCw size={17} className="spin" /> Bağlantı doğrulanıyor…</> : <><House size={17} /> Home Assistant’a bağlan</>}</button>
+      </form>
     </div>
   );
 }

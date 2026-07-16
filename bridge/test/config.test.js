@@ -25,11 +25,19 @@ test("local configuration and rules are created with private permissions", async
     ...first.config,
     gatewayIP: "192.168.1.50",
     accessToken: "local-secret-token",
+    homeAssistant: {
+      baseUrl: "http://127.0.0.1:8124",
+      accessToken: "home-assistant-local-secret",
+    },
   });
   const second = await loadOrCreateConfig(paths);
   assert.equal(second.created, false);
   assert.equal(second.config.bridgeKey, first.config.bridgeKey);
   assert.equal(second.config.accessToken, "local-secret-token");
+  assert.deepEqual(second.config.homeAssistant, {
+    baseUrl: "http://127.0.0.1:8124",
+    accessToken: "home-assistant-local-secret",
+  });
   assert.equal(updated.gatewayIP, "192.168.1.50");
   assert.equal((await stat(paths.configPath)).mode & 0o777, 0o600);
 

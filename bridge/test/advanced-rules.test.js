@@ -205,6 +205,213 @@ test("device state conditions support boolean and numeric comparisons with one r
   engine.stop();
 });
 
+test("Xiaomi and Home Assistant device state conditions support extended value types", async () => {
+  const device = {
+    id: "xiaomi-climate",
+    isReachable: true,
+    attributes: {
+      waterTankFull: false,
+      privacy: true,
+      pm25: 12,
+      pm10: 24,
+      humidity: 46,
+      targetHumidity: 50,
+      temperature: 22.5,
+      filterLife: 84,
+      percentage: 65,
+      presetMode: "Silent",
+    },
+  };
+  const { engine, calls } = createEngine({
+    getDevice: async () => structuredClone(device),
+  });
+  const rule = await engine.create({
+    name: "Healthy Xiaomi state",
+    trigger: { type: "button", deviceId: "button-1", clickPattern: "singlePress" },
+    conditions: {
+      deviceStates: [
+        { deviceId: device.id, attribute: "waterTankFull", operator: "equals", value: false },
+        { deviceId: device.id, attribute: "privacy", operator: "notEquals", value: false },
+        { deviceId: device.id, attribute: "pm25", operator: "lessThanOrEqual", value: 12 },
+        { deviceId: device.id, attribute: "pm10", operator: "lessThan", value: 25 },
+        { deviceId: device.id, attribute: "humidity", operator: "greaterThan", value: 45 },
+        { deviceId: device.id, attribute: "targetHumidity", operator: "equals", value: 50 },
+        { deviceId: device.id, attribute: "temperature", operator: "greaterThan", value: 20 },
+        { deviceId: device.id, attribute: "filterLife", operator: "greaterThan", value: 50 },
+        { deviceId: device.id, attribute: "percentage", operator: "notEquals", value: 0 },
+        { deviceId: device.id, attribute: "presetMode", operator: "equals", value: " Silent " },
+      ],
+    },
+    actions: [{ deviceId: "target-pass", isOn: true }],
+  });
+
+  assert.equal(rule.conditions.deviceStates.at(-1).value, "Silent");
+  await engine.handleEvent({
+    id: "xiaomi-condition-event",
+    type: "remotePressEvent",
+    time: new Date().toISOString(),
+    data: { id: "button-1", clickPattern: "singlePress" },
+  });
+  assert.deepEqual(calls.map((call) => call.id), ["target-pass"]);
+
+  await assert.rejects(
+    engine.create({
+      name: "Invalid preset comparison",
+      trigger: { type: "time", time: "12:00" },
+      conditions: {
+        deviceStates: [
+          {
+            deviceId: device.id,
+            attribute: "presetMode",
+            operator: "greaterThan",
+            value: "Silent",
+          },
+        ],
+      },
+      actions: [{ deviceId: "target-invalid", isOn: true }],
+    }),
+    /not supported for presetMode/,
+  );
+  await assert.rejects(
+    engine.create({
+      name: "Invalid tank value",
+      trigger: { type: "time", time: "12:00" },
+      conditions: {
+        deviceStates: [
+          {
+            deviceId: device.id,
+            attribute: "waterTankFull",
+            operator: "equals",
+            value: "false",
+          },
+        ],
+      },
+      actions: [{ deviceId: "target-invalid", isOn: true }],
+    }),
+    /must be a boolean/,
+  );
+  engine.stop();
+});
+
+test("state triggers fire only when a supported comparison crosses from false to true", async () => {
+  const { engine, calls } = createEngine();
+  const pmRule = await engine.create({
+    name: "Air quality worsened",
+    trigger: {
+      type: "state",
+      deviceId: "purifier-1",
+      attribute: "pm25",
+      operator: "greaterThanOrEqual",
+      value: 35,
+    },
+    actions: [{ deviceId: "purifier-1", attributes: { presetMode: "Auto" } }],
+  });
+  await engine.create({
+    name: "Camera entered privacy mode",
+    trigger: {
+      type: "state",
+      deviceId: "camera-1",
+      attribute: "privacy",
+      operator: "equals",
+      value: true,
+    },
+    actions: [{ deviceId: "hall-light", isOn: false }],
+  });
+  assert.deepEqual(pmRule.trigger, {
+    type: "state",
+    deviceId: "purifier-1",
+    attribute: "pm25",
+    operator: "greaterThanOrEqual",
+    value: 35,
+  });
+
+  const stateEvent = (id, deviceId, attributes, oldAttributes) => ({
+    id,
+    type: "deviceStateChanged",
+    time: new Date().toISOString(),
+    data: { id: deviceId, attributes, oldAttributes },
+  });
+  await engine.handleEvent(stateEvent("state-initial", "purifier-1", { pm25: 40 }, {}));
+  await engine.handleEvent(
+    stateEvent("state-malformed", "purifier-1", { pm25: "40" }, { pm25: 20 }),
+  );
+  await engine.handleEvent(stateEvent("state-cross-1", "purifier-1", { pm25: 35 }, { pm25: 20 }));
+  await engine.handleEvent(stateEvent("state-stays-true", "purifier-1", { pm25: 50 }, { pm25: 35 }));
+  await engine.handleEvent(stateEvent("state-falls", "purifier-1", { pm25: 30 }, { pm25: 50 }));
+  await engine.handleEvent(stateEvent("state-cross-2", "purifier-1", { pm25: 36 }, { pm25: 30 }));
+  await engine.handleEvent(
+    stateEvent("privacy-cross", "camera-1", { privacy: true }, { privacy: false }),
+  );
+  await engine.handleEvent(
+    stateEvent("privacy-stays", "camera-1", { privacy: true }, { privacy: true }),
+  );
+
+  assert.deepEqual(
+    calls.map((call) => [call.id, call.attributes]),
+    [
+      ["purifier-1", { presetMode: "Auto" }],
+      ["purifier-1", { presetMode: "Auto" }],
+      ["hall-light", { isOn: false }],
+    ],
+  );
+  assert.equal(engine.get(pmRule.id).runCount, 2);
+  await assert.rejects(
+    engine.create({
+      name: "Unsupported state trigger",
+      trigger: {
+        type: "state",
+        deviceId: "purifier-1",
+        attribute: "unknownMetric",
+        operator: "equals",
+        value: 1,
+      },
+      actions: [{ deviceId: "purifier-1", isOn: true }],
+    }),
+    /not a supported device state/,
+  );
+  engine.stop();
+});
+
+test("deviceEvent triggers match an exact safe event type and device", async () => {
+  const { engine, calls } = createEngine();
+  const rule = await engine.create({
+    name: "Camera person detected",
+    trigger: {
+      type: "deviceEvent",
+      deviceId: "camera-1",
+      eventType: "personDetected",
+    },
+    actions: [{ deviceId: "hall-light", isOn: true }],
+  });
+  assert.equal(rule.trigger.eventType, "personDetected");
+
+  const event = (id, type, deviceId, eventType) => ({
+    id,
+    type,
+    time: new Date().toISOString(),
+    data: { id: deviceId, eventType },
+  });
+  await engine.handleEvent(event("camera-wrong-envelope", "cameraEvent", "camera-1", "personDetected"));
+  await engine.handleEvent(event("camera-wrong-device", "deviceEvent", "camera-2", "personDetected"));
+  await engine.handleEvent(event("camera-wrong-type", "deviceEvent", "camera-1", "petDetected"));
+  await engine.handleEvent(event("camera-match", "deviceEvent", "camera-1", "personDetected"));
+  assert.deepEqual(calls.map((call) => call.id), ["hall-light"]);
+
+  await assert.rejects(
+    engine.create({
+      name: "Unsafe camera event",
+      trigger: {
+        type: "deviceEvent",
+        deviceId: "camera-1",
+        eventType: "../personDetected",
+      },
+      actions: [{ deviceId: "hall-light", isOn: true }],
+    }),
+    /unsupported characters/,
+  );
+  engine.stop();
+});
+
 test("condition read errors fail closed and produce a safe rule failure", async () => {
   const { engine, calls, executions } = createEngine({
     getDevice: async () => {

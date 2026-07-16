@@ -85,6 +85,13 @@ async function readJson(filePath) {
 }
 
 function validateStoredConfig(config) {
+  const homeAssistantValid =
+    config?.homeAssistant === undefined ||
+    config?.homeAssistant === null ||
+    (typeof config.homeAssistant === "object" &&
+      !Array.isArray(config.homeAssistant) &&
+      typeof config.homeAssistant.baseUrl === "string" &&
+      typeof config.homeAssistant.accessToken === "string");
   const valid =
     config &&
     typeof config === "object" &&
@@ -93,7 +100,8 @@ function validateStoredConfig(config) {
     typeof config.bridgeKey === "string" &&
     config.bridgeKey.length >= 32 &&
     (config.gatewayIP === null || typeof config.gatewayIP === "string") &&
-    (config.accessToken === null || typeof config.accessToken === "string");
+    (config.accessToken === null || typeof config.accessToken === "string") &&
+    homeAssistantValid;
 
   if (!valid) {
     const error = new Error("The local bridge configuration is invalid.");
@@ -111,6 +119,7 @@ export async function loadOrCreateConfig(paths = resolveDataPaths()) {
     bridgeKey: randomBytes(32).toString("base64url"),
     gatewayIP: process.env.DIRIGERA_GATEWAY_IP?.trim() || null,
     accessToken: null,
+    homeAssistant: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -129,6 +138,7 @@ export async function saveConfig(paths, config) {
     bridgeKey: config.bridgeKey,
     gatewayIP: config.gatewayIP ?? null,
     accessToken: config.accessToken ?? null,
+    homeAssistant: config.homeAssistant ?? null,
     createdAt: config.createdAt,
     updatedAt: new Date().toISOString(),
   };

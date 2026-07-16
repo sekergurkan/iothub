@@ -22,16 +22,33 @@ const DAY_ALIASES = new Map([
 ]);
 const FORBIDDEN_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const CLICK_PATTERNS = new Set(["singlePress", "doublePress", "longPress"]);
-const TRIGGER_TYPES = new Set(["motion", "occupancy", "button", "time"]);
+const TRIGGER_TYPES = new Set([
+  "motion",
+  "occupancy",
+  "button",
+  "time",
+  "state",
+  "deviceEvent",
+]);
 const DEVICE_CONDITION_ATTRIBUTES = new Map([
   ["isOn", { type: "boolean" }],
   ["isReachable", { type: "boolean" }],
   ["isDetected", { type: "boolean" }],
+  ["waterTankFull", { type: "boolean" }],
+  ["privacy", { type: "boolean" }],
   ["lightLevel", { type: "number", minimum: 0, maximum: 100 }],
   ["batteryPercentage", { type: "number", minimum: 0, maximum: 100 }],
   ["colorTemperature", { type: "number", minimum: 1_500, maximum: 6_500 }],
+  ["pm25", { type: "number", minimum: 0, maximum: 1_000 }],
+  ["pm10", { type: "number", minimum: 0, maximum: 1_000 }],
+  ["humidity", { type: "number", minimum: 0, maximum: 100 }],
+  ["targetHumidity", { type: "number", minimum: 0, maximum: 100 }],
+  ["temperature", { type: "number", minimum: -20, maximum: 60 }],
+  ["filterLife", { type: "number", minimum: 0, maximum: 100 }],
+  ["percentage", { type: "number", minimum: 0, maximum: 100 }],
+  ["presetMode", { type: "string", maximum: 128 }],
 ]);
-const BOOLEAN_CONDITION_OPERATORS = new Set(["equals", "notEquals"]);
+const EQUALITY_CONDITION_OPERATORS = new Set(["equals", "notEquals"]);
 const NUMBER_CONDITION_OPERATORS = new Set([
   "equals",
   "notEquals",
@@ -125,6 +142,95 @@ function normalizeDays(value, path) {
   return [...new Set(days)];
 }
 
+function normalizeEventType(value, path) {
+  const eventType = requiredString(value, path, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(eventType)) {
+    fail(`${path} contains unsupported characters.`, path);
+  }
+  return eventType;
+}
+
+function stateValueHasExpectedType(value, definition) {
+  if (definition.type === "boolean") return typeof value === "boolean";
+  if (definition.type === "string") return typeof value === "string";
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function stateValueIsValid(value, definition) {
+  if (!stateValueHasExpectedType(value, definition)) return false;
+  if (definition.type === "boolean") return true;
+  if (definition.type === "string") {
+    return Boolean(value.trim()) && value.trim().length <= definition.maximum;
+  }
+  return (
+    value >= definition.minimum &&
+    value <= definition.maximum
+  );
+}
+
+function normalizeStateComparison(input, path) {
+  if (!isObject(input)) fail(`${path} must be an object.`, path);
+  const definition = DEVICE_CONDITION_ATTRIBUTES.get(input.attribute);
+  if (!definition) {
+    fail(`${path}.attribute is not a supported device state.`, `${path}.attribute`);
+  }
+
+  const supportedOperators =
+    definition.type === "number"
+      ? NUMBER_CONDITION_OPERATORS
+      : EQUALITY_CONDITION_OPERATORS;
+  if (!supportedOperators.has(input.operator)) {
+    fail(
+      `${path}.operator is not supported for ${input.attribute}.`,
+      `${path}.operator`,
+    );
+  }
+
+  if (!stateValueIsValid(input.value, definition)) {
+    if (definition.type === "boolean") {
+      fail(`${path}.value must be a boolean.`, `${path}.value`);
+    }
+    if (definition.type === "string") {
+      fail(
+        `${path}.value must be a non-empty string of at most ${definition.maximum} characters.`,
+        `${path}.value`,
+      );
+    }
+    fail(
+      `${path}.value must be a number between ${definition.minimum} and ${definition.maximum}.`,
+      `${path}.value`,
+    );
+  }
+
+  return {
+    attribute: input.attribute,
+    operator: input.operator,
+    value: definition.type === "string" ? input.value.trim() : input.value,
+  };
+}
+
+function stateComparisonMatches(comparison, actualValue) {
+  const definition = DEVICE_CONDITION_ATTRIBUTES.get(comparison.attribute);
+  if (!definition || !stateValueHasExpectedType(actualValue, definition)) return false;
+
+  switch (comparison.operator) {
+    case "equals":
+      return actualValue === comparison.value;
+    case "notEquals":
+      return actualValue !== comparison.value;
+    case "greaterThan":
+      return actualValue > comparison.value;
+    case "greaterThanOrEqual":
+      return actualValue >= comparison.value;
+    case "lessThan":
+      return actualValue < comparison.value;
+    case "lessThanOrEqual":
+      return actualValue <= comparison.value;
+    default:
+      return false;
+  }
+}
+
 function safeClone(value, path = "value", depth = 0) {
   if (depth > 8) fail(`${path} is nested too deeply.`, path);
   if (value === null || typeof value === "string" || typeof value === "boolean") {
@@ -153,7 +259,10 @@ function safeClone(value, path = "value", depth = 0) {
 function normalizeTrigger(input) {
   if (!isObject(input)) fail("trigger must be an object.", "trigger");
   if (!TRIGGER_TYPES.has(input.type)) {
-    fail("trigger.type must be motion, occupancy, button, or time.", "trigger.type");
+    fail(
+      "trigger.type must be motion, occupancy, button, time, state, or deviceEvent.",
+      "trigger.type",
+    );
   }
 
   if (input.type === "time") {
@@ -169,6 +278,17 @@ function normalizeTrigger(input) {
     type: input.type,
     deviceId: normalizeDeviceId(input.deviceId, "trigger.deviceId"),
   };
+
+  if (input.type === "state") {
+    return { ...trigger, ...normalizeStateComparison(input, "trigger") };
+  }
+
+  if (input.type === "deviceEvent") {
+    return {
+      ...trigger,
+      eventType: normalizeEventType(input.eventType, "trigger.eventType"),
+    };
+  }
 
   if (input.type === "button") {
     if (!CLICK_PATTERNS.has(input.clickPattern)) {
@@ -217,50 +337,9 @@ function normalizeConditions(input) {
 
     deviceStates = input.deviceStates.map((condition, index) => {
       const path = `conditions.deviceStates[${index}]`;
-      if (!isObject(condition)) fail(`${path} must be an object.`, path);
-
+      const comparison = normalizeStateComparison(condition, path);
       const deviceId = normalizeDeviceId(condition.deviceId, `${path}.deviceId`);
-      const definition = DEVICE_CONDITION_ATTRIBUTES.get(condition.attribute);
-      if (!definition) {
-        fail(
-          `${path}.attribute is not a supported device state.`,
-          `${path}.attribute`,
-        );
-      }
-
-      const supportedOperators =
-        definition.type === "boolean"
-          ? BOOLEAN_CONDITION_OPERATORS
-          : NUMBER_CONDITION_OPERATORS;
-      if (!supportedOperators.has(condition.operator)) {
-        fail(
-          `${path}.operator is not supported for ${condition.attribute}.`,
-          `${path}.operator`,
-        );
-      }
-
-      if (definition.type === "boolean") {
-        if (typeof condition.value !== "boolean") {
-          fail(`${path}.value must be a boolean.`, `${path}.value`);
-        }
-      } else if (
-        typeof condition.value !== "number" ||
-        !Number.isFinite(condition.value) ||
-        condition.value < definition.minimum ||
-        condition.value > definition.maximum
-      ) {
-        fail(
-          `${path}.value must be a number between ${definition.minimum} and ${definition.maximum}.`,
-          `${path}.value`,
-        );
-      }
-
-      return {
-        deviceId,
-        attribute: condition.attribute,
-        operator: condition.operator,
-        value: condition.value,
-      };
+      return { deviceId, ...comparison };
     });
   }
 
@@ -478,31 +557,7 @@ function deviceConditionMatches(condition, device) {
       ? device.isReachable
       : device.attributes?.[condition.attribute];
   if (actualValue === undefined || actualValue === null) return false;
-  const definition = DEVICE_CONDITION_ATTRIBUTES.get(condition.attribute);
-  if (definition?.type === "boolean" && typeof actualValue !== "boolean") return false;
-  if (
-    definition?.type === "number" &&
-    (typeof actualValue !== "number" || !Number.isFinite(actualValue))
-  ) {
-    return false;
-  }
-
-  switch (condition.operator) {
-    case "equals":
-      return actualValue === condition.value;
-    case "notEquals":
-      return actualValue !== condition.value;
-    case "greaterThan":
-      return typeof actualValue === "number" && actualValue > condition.value;
-    case "greaterThanOrEqual":
-      return typeof actualValue === "number" && actualValue >= condition.value;
-    case "lessThan":
-      return typeof actualValue === "number" && actualValue < condition.value;
-    case "lessThanOrEqual":
-      return typeof actualValue === "number" && actualValue <= condition.value;
-    default:
-      return false;
-  }
+  return stateComparisonMatches(condition, actualValue);
 }
 
 function conditionReadError(error, deviceId) {
@@ -551,6 +606,33 @@ function eventMatchesTrigger(trigger, event) {
       event?.type === "deviceStateChanged" &&
       event?.data?.id === trigger.deviceId &&
       event?.data?.attributes?.isDetected === trigger.isDetected
+    );
+  }
+
+  if (trigger.type === "state") {
+    if (
+      event?.type !== "deviceStateChanged" ||
+      event?.data?.id !== trigger.deviceId ||
+      !isObject(event.data.attributes) ||
+      !isObject(event.data.oldAttributes)
+    ) {
+      return false;
+    }
+    const currentValue = event.data.attributes[trigger.attribute];
+    const previousValue = event.data.oldAttributes[trigger.attribute];
+    const definition = DEVICE_CONDITION_ATTRIBUTES.get(trigger.attribute);
+    if (!definition || !stateValueHasExpectedType(previousValue, definition)) return false;
+    return (
+      stateComparisonMatches(trigger, currentValue) &&
+      !stateComparisonMatches(trigger, previousValue)
+    );
+  }
+
+  if (trigger.type === "deviceEvent") {
+    return (
+      event?.type === "deviceEvent" &&
+      event?.data?.id === trigger.deviceId &&
+      event?.data?.eventType === trigger.eventType
     );
   }
 

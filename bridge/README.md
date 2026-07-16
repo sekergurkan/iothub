@@ -1,6 +1,6 @@
-# DIRIGERA yerel köprü
+# DIRIGERA + Home Assistant yerel köprüsü
 
-Bu servis IKEA DIRIGERA hub'ını yalnızca yerel makinede çalışan bir HTTP API'ye bağlar. Web UI kapalı olsa bile servis çalıştığı sürece hareket, buton ve zaman kuralları çalışmaya devam eder.
+Bu servis IKEA DIRIGERA hub'ını ve Xiaomi cihazlarını sunan yerel Home Assistant örneğini tek bir HTTP API'de birleştirir. Web UI kapalı olsa bile servis çalıştığı sürece kurallar çalışmaya devam eder.
 
 Servis [`dirigera`](https://github.com/lpgera/dirigera) istemcisinin sabitlenmiş `2.0.0` sürümünü kullanır. DIRIGERA'nın yerel API'si resmi ve kararlı bir genel API değildir; hub firmware güncellemeleri uyumluluğu etkileyebilir.
 
@@ -14,7 +14,7 @@ cp bridge/.env.example bridge/.env
 npm start --prefix bridge
 ```
 
-Varsayılan adres `http://127.0.0.1:8787`'dir. İlk çalıştırmada kriptografik olarak rastgele bir bridge key üretilir ve terminalde **yalnızca bir kez** gösterilir. Anahtar ile DIRIGERA access token'ı `bridge/.data/config.json` içinde, dosya modu `0600` olacak şekilde saklanır. Bu dosyayı paylaşmayın veya kaynak kontrolüne eklemeyin.
+Varsayılan adres `http://127.0.0.1:8787`'dir. İlk çalıştırmada kriptografik olarak rastgele bir bridge key üretilir ve terminalde **yalnızca bir kez** gösterilir. Anahtar ile DIRIGERA/Home Assistant access token'ları `bridge/.data/config.json` içinde, dosya modu `0600` olacak şekilde saklanır. Bu dosyayı paylaşmayın veya kaynak kontrolüne eklemeyin.
 
 Anahtarı kaybederseniz yalnızca yerel makinede şu dosyadan okuyabilirsiniz:
 
@@ -60,7 +60,9 @@ curl http://127.0.0.1:8787/api/status \
 | `GET` | `/api/health` | Anahtar gerektirmeyen minimal servis sağlığı |
 | `POST` | `/api/pair` | `{ "gatewayIP": "..." }`; alan isteğe bağlı |
 | `GET` | `/api/status` | `paired`, `connected`, hub ve köprü durumu |
-| `GET` | `/api/home` | DIRIGERA'nın ham home nesnesi |
+| `GET` | `/api/home` | DIRIGERA home nesnesi ve kanonik Xiaomi cihazları |
+| `GET` | `/api/integrations/home-assistant/status` | Secretsız HA bağlantı durumu |
+| `POST`, `DELETE` | `/api/integrations/home-assistant/configure` | `{ "baseUrl": "...", "accessToken": "..." }` ile bağlan / yerel token'ı sil |
 | `PATCH` | `/api/devices/:id` | `{ "attributes": {...}, "transitionTime": 500? }` |
 | `POST` | `/api/rooms/:id/state` | `{ "isOn": true }` veya `{ "attributes": {...}, "deviceType": "light"? }` |
 | `POST` | `/api/scenes/:id/trigger` | Sahneyi tetikler |
@@ -69,7 +71,7 @@ curl http://127.0.0.1:8787/api/status \
 | `GET` | `/api/events?limit=100&after=0` | Bellekteki son WebSocket/kural olayları |
 | `GET` | `/api/events/stream` | Server-Sent Events akışı |
 
-Oda state endpoint'i `isOn`, `attributes`, `deviceType` ve `transitionTime` alanlarını birlikte de kabul eder. Cihaz ve kural aksiyonları sonunda `client.devices.setAttributes(...)` kullanır.
+Oda state endpoint'i `isOn`, `attributes`, `deviceType` ve `transitionTime` alanlarını birlikte de kabul eder. `ha_` önekli Xiaomi cihaz komutları Home Assistant servislerine, diğer cihazlar DIRIGERA'ya yönlendirilir.
 
 ## Kural modeli
 
@@ -113,14 +115,19 @@ Desteklenen tetikleyiciler:
 - `motion` ve `occupancy`: `deviceStateChanged` olayındaki `attributes.isDetected` değerini izler. İsteğe bağlı `isDetected` varsayılan olarak `true`'dur.
 - `button`: `remotePressEvent` olayını `deviceId` ve `clickPattern` (`singlePress`, `doublePress`, `longPress`) ile eşler.
 - `time`: yerel makine saatinde `time: "HH:MM"` değerinde çalışır; tetikleyicide ayrıca `days` verilebilir.
+- `state`: bir cihaz özniteliği seçilen eşiği ilk kez geçtiğinde çalışır. Yeni ve önceki değer birlikte değerlendirilir; koşul doğru kaldığı sürece tekrar tetiklenmez.
+- `deviceEvent`: Home Assistant'ın güvenli biçimde kanonikleştirdiği kamera olaylarını `deviceId` ve `eventType` ile kesin eşler.
 
 `conditions.days`, `conditions.startTime` ve `conditions.endTime` tüm tetikleyicilerde kullanılabilir. Bitiş saati başlangıçtan küçükse aralık gece yarısını geçer. Hiçbir koşul seçilmediyse bu alanlar JSON'a eklenmez; `days` veya `deviceStates` etkinleştirilmiş fakat boş bırakılmışsa kural reddedilir.
 
 `conditions.deviceStates` içindeki bütün satırlar birlikte doğru olmalıdır. Desteklenen durumlar ve operatörler:
 
-- `isOn`, `isReachable`, `isDetected`: `equals`, `notEquals` ve boolean değer.
-- `lightLevel`, `batteryPercentage`: `equals`, `notEquals`, `greaterThan`, `greaterThanOrEqual`, `lessThan`, `lessThanOrEqual` ve `0-100` değer.
+- `isOn`, `isReachable`, `isDetected`, `waterTankFull`, `privacy`: `equals`, `notEquals` ve boolean değer.
+- `lightLevel`, `batteryPercentage`, `humidity`, `targetHumidity`, `filterLife`, `percentage`: `equals`, `notEquals`, `greaterThan`, `greaterThanOrEqual`, `lessThan`, `lessThanOrEqual` ve `0-100` değer.
+- `pm25`, `pm10`: aynı sayısal operatörler ve `0-1000` değer.
+- `temperature`: aynı sayısal operatörler ve `-20–60 °C` değer.
 - `colorTemperature`: aynı sayısal operatörler ve `1500-6500 K` değer.
+- `presetMode`: `equals`, `notEquals` ve metin değer.
 
 Durumu okunamayan veya ilgili özniteliği bulunmayan cihaz koşulu güvenli biçimde `false` kabul edilir; kural aksiyonları çalışmaz. Aynı değerlendirmede aynı cihaz yalnız bir kez okunur.
 

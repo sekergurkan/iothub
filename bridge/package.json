@@ -1,8 +1,8 @@
 {
   "name": "dirigera-local-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Local-only HTTP bridge and automation engine for an IKEA DIRIGERA hub",
+  "description": "Local-only bridge and automation engine for IKEA DIRIGERA and Xiaomi Home devices",
   "type": "module",
   "engines": {
     "node": ">=22.13.0"

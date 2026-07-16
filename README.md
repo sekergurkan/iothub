@@ -1,6 +1,6 @@
 # Yuva
 
-Yuva; IKEA DIRIGERA'ya bağlı ışık, hareket sensörü ve butonları tek bir Türkçe web arayüzünden yönetmek ve bunlar için görsel kurallar oluşturmak üzere hazırlanmış yerel öncelikli bir kontrol merkezidir.
+Yuva; IKEA DIRIGERA ve Xiaomi Home cihazlarını tek bir Türkçe web arayüzünden yönetmek ve bunlar için görsel kurallar oluşturmak üzere hazırlanmış yerel öncelikli bir kontrol merkezidir.
 
 ## Neler var?
 
@@ -13,6 +13,7 @@ Yuva; IKEA DIRIGERA'ya bağlı ışık, hareket sensörü ve butonları tek bir 
 - Canlı olay geçmişi ve cihaz bağlantı durumu
 - Hub bulunmadığında tüm ekranları deneyebilmek için demo modu
 - Web UI kapalıyken de kuralları çalıştıran ayrı yerel DIRIGERA köprüsü
+- Home Assistant üzerinden Xiaomi hava temizleyici, nem alma cihazı, ampul ve kamera kontrolleri
 
 ## Hızlı demo
 
@@ -48,9 +49,23 @@ Yayımlanan web adresi arayüzü ve demo evini her yerden açabilir; gerçek DIR
 
 Köprünün API, ağ erişimi ve güvenlik ayarları için [bridge/README.md](bridge/README.md) dosyasına bakın.
 
+## Xiaomi / Home Assistant bağlantısı
+
+Xiaomi cihazları resmî **Xiaomi Home** Home Assistant entegrasyonu üzerinden bağlanır. Hazır Docker kurulumu `127.0.0.1:8124` adresini kullanır:
+
+```bash
+docker compose -f home-assistant/compose.yaml up -d
+./home-assistant/install-xiaomi-home.sh
+docker compose -f home-assistant/compose.yaml restart
+```
+
+İlk Home Assistant hesabını oluşturduktan sonra Xiaomi Home entegrasyonunda Xiaomi hesabınızla giriş yapın. Home Assistant profilinden oluşturacağınız uzun ömürlü erişim token'ını Yuva'daki **Ayarlar → Xiaomi / Home Assistant** ekranına girin. Ayrıntılı yönerge için [home-assistant/README.md](home-assistant/README.md) dosyasına bakın.
+
+Yuva, Air Purifier 4 Pro, Smart Dehumidifier ve Mi Smart LED Bulb White için Home Assistant'ın sunduğu gerçek kontrolleri kullanır. Xiaomi Smart Camera C701 için durum/algılama olayları ve varsa gizlilik kontrolü gösterilir; resmî entegrasyon canlı video akışı sunmadığı için panelde sahte bir kamera görüntüsü oluşturulmaz.
+
 ## Kurallar nasıl çalışır?
 
-Kural motoru köprü servisinde çalışır ve hareket, buton ve saat olaylarını DIRIGERA'nın WebSocket akışından izler. Bir kural en fazla 32 ışığı yönetebilir; gün/saat filtresi, başka cihazların açık-kapalı/erişilebilir/hareket/pil/parlaklık/sıcaklık durumu ve tekrar çalışma beklemesi birlikte kullanılabilir. Kurallar `bridge/.data/rules.json` içinde saklanır. Böylece web sayfasını kapatabilirsiniz; köprü servisi açık kaldığı sürece otomasyonlar devam eder.
+Kural motoru köprü servisinde çalışır; DIRIGERA ve Home Assistant olaylarını izler. Bir kural en fazla 32 cihazı yönetebilir; gün/saat filtresi, cihaz durumu ve tekrar çalışma beklemesi birlikte kullanılabilir. Xiaomi ışık, hava temizleyici ve nem alma cihazı da kural hedefi olabilir. Kurallar `bridge/.data/rules.json` içinde saklanır. Böylece web sayfasını kapatabilirsiniz; köprü servisi açık kaldığı sürece otomasyonlar devam eder.
 
 Bir otomasyondaki cihazlardan biri çevrimdışıysa diğer hedeflerin komutları yine denenir ve sonuç geçmiş ekranında hata olarak görünür. Etkinleştirmediğiniz ileri seçenekler kaydedilen kural JSON'una hiç eklenmez; etkinleştirip zorunlu seçimi boş bıraktığınız seçeneklerde arayüz kayda izin vermez.
 
@@ -67,7 +82,7 @@ npm test --prefix bridge
 
 ## Güvenlik notları
 
-- `bridge/.data/`, `.env` dosyaları ve access token kaynak kontrolüne eklenmez.
+- `bridge/.data/`, `home-assistant/config/`, `.env` dosyaları ve access token'lar kaynak kontrolüne eklenmez.
 - Köprü varsayılan olarak yalnızca `127.0.0.1` üzerinde dinler.
 - Başka bir cihazdan erişim açmadan önce TLS reverse proxy, firewall ve dar bir CORS origin listesi kullanın.
 - Kullanılan [`dirigera`](https://github.com/lpgera/dirigera) istemcisi tersine mühendisliğe dayalı gayriresmî bir kütüphanedir; DIRIGERA firmware güncellemeleri uyumluluğu etkileyebilir.
