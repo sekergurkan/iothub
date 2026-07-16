@@ -59,6 +59,8 @@ const NUMBER_CONDITION_OPERATORS = new Set([
 ]);
 const EFFECT_RESTORE_WATCHDOG_CHECKS = 5;
 const EFFECT_RESTORE_WATCHDOG_INTERVAL_MS = 1_000;
+const MOTION_CONTROL_MODES = new Set(["entryExit"]);
+const MOTION_CONTROL_RETRY_MS = 5_000;
 
 export class RuleValidationError extends Error {
   constructor(message, path = undefined) {
@@ -477,12 +479,79 @@ function normalizeEffect(input) {
   };
 }
 
+function normalizeMotionControl(input) {
+  if (input === undefined || input === null) return undefined;
+  if (!isObject(input)) fail("motionControl must be an object.", "motionControl");
+  if (!MOTION_CONTROL_MODES.has(input.mode)) {
+    fail("motionControl.mode must be entryExit.", "motionControl.mode");
+  }
+  const minimumOnSeconds = optionalInteger(
+    input.minimumOnSeconds,
+    "motionControl.minimumOnSeconds",
+    { minimum: 10, maximum: 3_600 },
+  );
+  const inactivitySeconds = optionalInteger(
+    input.inactivitySeconds,
+    "motionControl.inactivitySeconds",
+    { minimum: 1, maximum: 86_400 },
+  );
+  if (minimumOnSeconds === undefined) {
+    fail(
+      "motionControl.minimumOnSeconds is required.",
+      "motionControl.minimumOnSeconds",
+    );
+  }
+  if (inactivitySeconds === undefined) {
+    fail(
+      "motionControl.inactivitySeconds is required.",
+      "motionControl.inactivitySeconds",
+    );
+  }
+  return { mode: "entryExit", minimumOnSeconds, inactivitySeconds };
+}
+
 function isIsoDate(value) {
   return (
     typeof value === "string" &&
     Number.isFinite(Date.parse(value)) &&
     new Date(value).toISOString() === value
   );
+}
+
+function normalizeMotionRuntime(input, motionControl) {
+  if (input === undefined || input === null || !motionControl) return undefined;
+  if (!isObject(input)) fail("_motionRuntime must be an object.", "_motionRuntime");
+  if (!new Set(["detected", "clearWaiting"]).has(input.phase)) {
+    fail("_motionRuntime.phase is invalid.", "_motionRuntime.phase");
+  }
+  if (!isIsoDate(input.openedAt)) {
+    fail("_motionRuntime.openedAt is invalid.", "_motionRuntime.openedAt");
+  }
+  if (!Number.isInteger(input.revision) || input.revision < 1) {
+    fail("_motionRuntime.revision is invalid.", "_motionRuntime.revision");
+  }
+  if (
+    input.phase === "clearWaiting" &&
+    !isIsoDate(input.inactivityDeadline)
+  ) {
+    fail(
+      "_motionRuntime.inactivityDeadline is invalid.",
+      "_motionRuntime.inactivityDeadline",
+    );
+  }
+  return {
+    phase: input.phase,
+    openedAt: input.openedAt,
+    inactivityDeadline:
+      input.phase === "clearWaiting" ? input.inactivityDeadline : null,
+    revision: input.revision,
+  };
+}
+
+function publicRule(rule) {
+  if (!isObject(rule)) return rule;
+  const { _motionRuntime, ...visible } = rule;
+  return visible;
 }
 
 export function normalizeRule(
@@ -503,6 +572,12 @@ export function normalizeRule(
       ? undefined
       : existing?.effect;
   const effect = normalizeEffect(effectValue);
+  const motionControlValue = Object.hasOwn(input, "motionControl")
+    ? input.motionControl
+    : replace
+      ? undefined
+      : existing?.motionControl;
+  const motionControl = normalizeMotionControl(motionControlValue);
   const actionInput = input.actions ?? existing?.actions;
   if (!Array.isArray(actionInput) || actionInput.length === 0 || actionInput.length > 32) {
     fail("actions must contain between 1 and 32 actions.", "actions");
@@ -528,6 +603,45 @@ export function normalizeRule(
     "cooldownSeconds",
     { minimum: 0, maximum: 86_400 },
   );
+
+  if (motionControl) {
+    if (
+      !["motion", "occupancy"].includes(trigger.type) ||
+      trigger.isDetected !== true
+    ) {
+      fail(
+        "motionControl requires a detected motion or occupancy trigger.",
+        "motionControl",
+      );
+    }
+    if (actions.length !== 1) {
+      fail("motionControl requires exactly one target action.", "actions");
+    }
+    if (actionAttributes(actions[0]).isOn !== true) {
+      fail(
+        "motionControl requires an action that turns its target on.",
+        "actions[0]",
+      );
+    }
+    if (effect) {
+      fail("motionControl cannot be combined with an effect.", "effect");
+    }
+    if (
+      offAfterSeconds !== undefined ||
+      actions[0].offAfterSeconds !== undefined
+    ) {
+      fail(
+        "motionControl cannot be combined with offAfterSeconds.",
+        "offAfterSeconds",
+      );
+    }
+    if (cooldownSeconds !== undefined) {
+      fail(
+        "motionControl cannot be combined with cooldownSeconds.",
+        "cooldownSeconds",
+      );
+    }
+  }
 
   if (effect) {
     const targetIds = new Set();
@@ -573,6 +687,9 @@ export function normalizeRule(
   const lastRun = isIsoDate(lastRunInput) ? lastRunInput : null;
   const runCountInput = stored ? input.runCount : existing?.runCount;
   const runCount = Number.isInteger(runCountInput) && runCountInput >= 0 ? runCountInput : 0;
+  const motionRuntime = stored
+    ? normalizeMotionRuntime(input._motionRuntime, motionControl)
+    : undefined;
 
   return {
     id,
@@ -582,8 +699,10 @@ export function normalizeRule(
     conditions,
     actions,
     ...(effect ? { effect } : {}),
+    ...(motionControl ? { motionControl } : {}),
     ...(offAfterSeconds !== undefined ? { offAfterSeconds } : {}),
     ...(cooldownSeconds !== undefined ? { cooldownSeconds } : {}),
+    ...(motionRuntime ? { _motionRuntime: motionRuntime } : {}),
     lastRun,
     runCount,
     createdAt,
@@ -717,6 +836,17 @@ function eventMatchesTrigger(trigger, event) {
   return false;
 }
 
+function eventMatchesRule(rule, event) {
+  if (rule.motionControl) {
+    return (
+      event?.type === "deviceStateChanged" &&
+      event?.data?.id === rule.trigger.deviceId &&
+      typeof event?.data?.attributes?.isDetected === "boolean"
+    );
+  }
+  return eventMatchesTrigger(rule.trigger, event);
+}
+
 function actionAttributes(action) {
   const attributes = action.attributes ? safeClone(action.attributes, "action.attributes") : {};
   if (action.isOn !== undefined) attributes.isOn = action.isOn;
@@ -820,12 +950,17 @@ export class RuleEngine {
   #running = new Set();
   #pendingEvents = new Map();
   #offTimers = new Map();
+  #motionTimers = new Map();
+  #motionReconcileTimers = new Map();
+  #motionTimerHolds = new Map();
   #deviceActionVersions = new Map();
   #seenEventIds = new Set();
   #seenEventOrder = [];
   #scheduleTimer = null;
   #lastMinute = minuteKey(new Date());
   #stopped = false;
+  #setTimeout;
+  #clearTimeout;
 
   constructor({
     rules,
@@ -835,6 +970,8 @@ export class RuleEngine {
     onExecution = () => {},
     wait = defaultWait,
     now = () => Date.now(),
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
   }) {
     this.#rules = rules.map((rule, index) => {
       try {
@@ -860,10 +997,13 @@ export class RuleEngine {
     this.#onExecution = onExecution;
     this.#wait = wait;
     this.#now = now;
+    this.#setTimeout = setTimeoutImpl;
+    this.#clearTimeout = clearTimeoutImpl;
   }
 
   start() {
     if (this.#stopped || this.#scheduleTimer) return;
+    this.#restoreMotionTimers();
     this.#scheduleNextTick();
   }
 
@@ -881,22 +1021,29 @@ export class RuleEngine {
   }
 
   list() {
-    return structuredClone(this.#rules);
+    return structuredClone(this.#rules.map(publicRule));
   }
 
   get(id) {
     const rule = this.#rules.find((item) => item.id === id);
-    return rule ? structuredClone(rule) : null;
+    return rule ? structuredClone(publicRule(rule)) : null;
   }
 
   supersedeDevice(deviceId) {
-    this.#beginDeviceAction(normalizeDeviceId(deviceId, "deviceId"));
+    const normalizedId = normalizeDeviceId(deviceId, "deviceId");
+    this.#beginDeviceAction(normalizedId);
+    return this.#releaseMotionOwnership(new Set([normalizedId]));
   }
 
   supersedeAllDevices() {
-    for (const deviceId of [...this.#deviceActionVersions.keys()]) {
+    const deviceIds = new Set(this.#deviceActionVersions.keys());
+    for (const rule of this.#rules) {
+      if (rule.motionControl) deviceIds.add(rule.actions[0].deviceId);
+    }
+    for (const deviceId of deviceIds) {
       this.#beginDeviceAction(deviceId);
     }
+    return this.#releaseMotionOwnership(deviceIds);
   }
 
   async run(id) {
@@ -907,11 +1054,25 @@ export class RuleEngine {
       error.status = 404;
       throw error;
     }
-    await this.#execute(rule, {
-      id: `manual-${randomUUID()}`,
-      type: "manual",
-      time: new Date().toISOString(),
-    });
+    const time = new Date().toISOString();
+    await this.#execute(
+      rule,
+      rule.motionControl
+        ? {
+            id: `manual-${randomUUID()}`,
+            type: "deviceStateChanged",
+            time,
+            data: {
+              id: rule.trigger.deviceId,
+              attributes: { isDetected: true },
+            },
+          }
+        : {
+            id: `manual-${randomUUID()}`,
+            type: "manual",
+            time,
+          },
+    );
     return this.get(id);
   }
 
@@ -935,11 +1096,17 @@ export class RuleEngine {
         error.status = 409;
         throw error;
       }
-      return { nextRules: [...rules, rule], result: rule };
+      return { nextRules: [...rules, rule], result: publicRule(rule) };
     });
   }
 
   update(id, input, { replace = false } = {}) {
+    const previousRule = this.#rules.find((rule) => rule.id === id);
+    if (previousRule?.motionControl) {
+      this.#clearMotionTimer(id);
+      this.#clearMotionReconcileTimer(id);
+      this.#beginDeviceAction(previousRule.actions[0].deviceId);
+    }
     const operation = this.#mutate((rules) => {
       const index = rules.findIndex((rule) => rule.id === id);
       if (index === -1) {
@@ -951,15 +1118,27 @@ export class RuleEngine {
       const rule = normalizeRule(input, { existing: rules[index], replace });
       const nextRules = rules.slice();
       nextRules[index] = rule;
-      return { nextRules, result: rule };
+      return { nextRules, result: publicRule(rule) };
     });
     return operation.then((rule) => {
       this.#clearRuleTimers(id);
       return rule;
+    }).catch((error) => {
+      const currentRule = this.#rules.find((rule) => rule.id === id);
+      if (currentRule?._motionRuntime?.phase === "clearWaiting") {
+        this.#armMotionTimer(currentRule);
+      }
+      throw error;
     });
   }
 
   delete(id) {
+    const previousRule = this.#rules.find((rule) => rule.id === id);
+    if (previousRule?.motionControl) {
+      this.#clearMotionTimer(id);
+      this.#clearMotionReconcileTimer(id);
+      this.#beginDeviceAction(previousRule.actions[0].deviceId);
+    }
     const operation = this.#mutate((rules) => {
       const index = rules.findIndex((rule) => rule.id === id);
       if (index === -1) {
@@ -971,12 +1150,18 @@ export class RuleEngine {
       const [removed] = rules.slice(index, index + 1);
       return {
         nextRules: rules.filter((rule) => rule.id !== id),
-        result: removed,
+        result: publicRule(removed),
       };
     });
     return operation.then((rule) => {
       this.#clearRuleTimers(id);
       return rule;
+    }).catch((error) => {
+      const currentRule = this.#rules.find((rule) => rule.id === id);
+      if (currentRule?._motionRuntime?.phase === "clearWaiting") {
+        this.#armMotionTimer(currentRule);
+      }
+      throw error;
     });
   }
 
@@ -995,10 +1180,21 @@ export class RuleEngine {
     const candidates = this.#rules.filter(
       (rule) =>
         rule.enabled &&
-        eventMatchesTrigger(rule.trigger, event) &&
+        eventMatchesRule(rule, event),
+    );
+    const activeMotionRules = candidates.filter(
+      (rule) => rule.motionControl && rule._motionRuntime,
+    );
+    const conditionCandidates = candidates.filter(
+      (rule) =>
+        !(rule.motionControl && rule._motionRuntime) &&
         conditionsMatch(rule.conditions, eventDate),
     );
-    const matches = await this.#filterByDeviceConditions(candidates, event);
+    const conditionMatches = await this.#filterByDeviceConditions(
+      conditionCandidates,
+      event,
+    );
+    const matches = [...activeMotionRules, ...conditionMatches];
     await Promise.allSettled(matches.map((rule) => this.#execute(rule, event)));
   }
 
@@ -1079,7 +1275,11 @@ export class RuleEngine {
       while (currentRule && !this.#stopped) {
         if (ruleIsCoolingDown(currentRule)) break;
         try {
-          await this.#executeOnce(currentRule, currentEvent);
+          if (currentRule.motionControl) {
+            await this.#executeMotionControlOnce(currentRule, currentEvent);
+          } else {
+            await this.#executeOnce(currentRule, currentEvent);
+          }
         } catch (error) {
           firstError ??= error;
         }
@@ -1105,6 +1305,9 @@ export class RuleEngine {
         ? await this.#executeBlinkEffect(rule)
         : [];
       if (!rule.effect) {
+        await this.#releaseMotionOwnership(
+          new Set(rule.actions.map((action) => action.deviceId)),
+        );
         for (const [actionIndex, action] of rule.actions.entries()) {
           const attributes = actionAttributes(action);
           const actionVersion = this.#beginDeviceAction(action.deviceId);
@@ -1161,7 +1364,593 @@ export class RuleEngine {
     }
   }
 
+  async #executeMotionControlOnce(rule, triggerEvent) {
+    const isDetected = triggerEvent?.data?.attributes?.isDetected;
+    if (typeof isDetected !== "boolean") return;
+
+    const currentRule = this.#rules.find(
+      (item) => item.id === rule.id && item.enabled && item.motionControl,
+    );
+    if (!currentRule) return;
+    const runtime = currentRule._motionRuntime;
+    const now = this.#now();
+
+    if (!runtime) {
+      if (isDetected) {
+        await this.#openMotionSession(currentRule, triggerEvent, now);
+      }
+      return;
+    }
+
+    if (runtime.phase === "detected") {
+      if (isDetected) return;
+      const nextRule = await this.#writeMotionRuntime(
+        currentRule.id,
+        {
+          phase: "clearWaiting",
+          openedAt: runtime.openedAt,
+          inactivityDeadline: new Date(
+            now + currentRule.motionControl.inactivitySeconds * 1_000,
+          ).toISOString(),
+        },
+        runtime.revision,
+      );
+      if (nextRule?._motionRuntime) this.#armMotionTimer(nextRule);
+      return;
+    }
+
+    if (!isDetected) {
+      const nextRule = await this.#writeMotionRuntime(
+        currentRule.id,
+        {
+          phase: "clearWaiting",
+          openedAt: runtime.openedAt,
+          inactivityDeadline: new Date(
+            now + currentRule.motionControl.inactivitySeconds * 1_000,
+          ).toISOString(),
+        },
+        runtime.revision,
+      );
+      if (nextRule?._motionRuntime) this.#armMotionTimer(nextRule);
+      return;
+    }
+
+    this.#clearMotionTimer(currentRule.id);
+    const openedAt = Date.parse(runtime.openedAt);
+    if (
+      !Number.isFinite(openedAt) ||
+      now - openedAt < currentRule.motionControl.minimumOnSeconds * 1_000
+    ) {
+      await this.#writeMotionRuntime(
+        currentRule.id,
+        {
+          phase: "detected",
+          openedAt: runtime.openedAt,
+          inactivityDeadline: null,
+        },
+        runtime.revision,
+      );
+      return;
+    }
+
+    await this.#closeMotionSession(
+      currentRule,
+      triggerEvent,
+      now,
+      runtime.revision,
+    );
+  }
+
+  async #openMotionSession(rule, triggerEvent, now) {
+    const action = rule.actions[0];
+    const startedAt = new Date(now).toISOString();
+    const failures = [];
+    let turnedOn = false;
+
+    if (typeof this.#getDevice === "function") {
+      try {
+        const device = await this.#getDevice(action.deviceId, { fresh: true });
+        if (device?.attributes?.isOn === true) return;
+      } catch {
+        // If the state probe is unavailable, keep the safety-first behavior and
+        // attempt the requested entry scene instead of leaving the room dark.
+      }
+    }
+
+    const actionVersion = this.#beginDeviceAction(action.deviceId);
+
+    try {
+      const requests = actionAttributeRequests(actionAttributes(action));
+      for (const [requestIndex, attributes] of requests.entries()) {
+        if (
+          this.#deviceActionVersions.get(action.deviceId) !== actionVersion
+        ) {
+          break;
+        }
+        try {
+          await this.#setDeviceAttributes({
+            id: action.deviceId,
+            attributes,
+            transitionTime: action.transitionTime,
+          });
+          if (attributes.isOn === true) turnedOn = true;
+        } catch (error) {
+          failures.push({
+            deviceId: action.deviceId,
+            actionIndex: 0,
+            requestIndex,
+            stage: "motionOpen",
+            error,
+          });
+          if (attributes.isOn === true) break;
+        }
+      }
+
+      if (
+        turnedOn &&
+        this.#deviceActionVersions.get(action.deviceId) === actionVersion
+      ) {
+        const persistedRule = await this.#writeMotionRuntime(rule.id, {
+          phase: "detected",
+          openedAt: startedAt,
+          inactivityDeadline: null,
+        });
+        const persistedRevision = persistedRule?._motionRuntime?.revision;
+        if (
+          persistedRevision === undefined ||
+          this.#deviceActionVersions.get(action.deviceId) !== actionVersion
+        ) {
+          if (persistedRevision !== undefined) {
+            await this.#writeMotionRuntime(rule.id, null, persistedRevision);
+          }
+          return;
+        }
+        await this.#recordRun(rule.id, startedAt);
+      }
+      if (failures.length) throw actionFailuresError(failures);
+
+      this.#onExecution({
+        status: "success",
+        source: "motionControl",
+        ruleId: rule.id,
+        ruleName: rule.name,
+        triggerEvent,
+        at: startedAt,
+      });
+    } catch (error) {
+      this.#onExecution({
+        status: "error",
+        source: "motionControl",
+        ruleId: rule.id,
+        ruleName: rule.name,
+        triggerEvent,
+        error,
+        at: startedAt,
+      });
+      throw error;
+    }
+  }
+
+  async #closeMotionSession(rule, triggerEvent, now, expectedRevision) {
+    const action = rule.actions[0];
+    const startedAt = new Date(now).toISOString();
+    const actionVersion = this.#beginDeviceAction(action.deviceId);
+    try {
+      await this.#setDeviceAttributes({
+        id: action.deviceId,
+        attributes: { isOn: false },
+        transitionTime: action.transitionTime,
+      });
+      if (this.#deviceActionVersions.get(action.deviceId) === actionVersion) {
+        await this.#writeMotionRuntime(rule.id, null, expectedRevision);
+      }
+      await this.#recordRun(rule.id, startedAt);
+      this.#onExecution({
+        status: "success",
+        source: "motionControl",
+        ruleId: rule.id,
+        ruleName: rule.name,
+        triggerEvent,
+        at: startedAt,
+      });
+    } catch (error) {
+      const latest = this.#rules.find((item) => item.id === rule.id);
+      if (latest?._motionRuntime?.revision === expectedRevision) {
+        const retryRule = await this.#writeMotionRuntime(
+          rule.id,
+          {
+            phase: "clearWaiting",
+            openedAt: latest._motionRuntime.openedAt,
+            inactivityDeadline: new Date(now).toISOString(),
+          },
+          expectedRevision,
+        );
+        if (retryRule?._motionRuntime) {
+          this.#armMotionTimer(retryRule, MOTION_CONTROL_RETRY_MS);
+        }
+      }
+      this.#onExecution({
+        status: "error",
+        source: "motionControl",
+        ruleId: rule.id,
+        ruleName: rule.name,
+        triggerEvent,
+        error,
+        at: startedAt,
+      });
+      throw error;
+    }
+  }
+
+  async #writeMotionRuntime(ruleId, nextRuntime, expectedRevision = undefined) {
+    let applied = false;
+    await this.#mutate((rules) => {
+      const index = rules.findIndex((rule) => rule.id === ruleId);
+      if (index === -1) return { nextRules: rules, result: false };
+      const current = rules[index];
+      const currentRevision = current._motionRuntime?.revision;
+      if (
+        expectedRevision !== undefined &&
+        currentRevision !== expectedRevision
+      ) {
+        return { nextRules: rules, result: false };
+      }
+
+      const updated = { ...current };
+      if (nextRuntime) {
+        updated._motionRuntime = {
+          ...nextRuntime,
+          revision: (currentRevision ?? 0) + 1,
+        };
+      } else {
+        delete updated._motionRuntime;
+      }
+      const nextRules = rules.slice();
+      nextRules[index] = updated;
+      applied = true;
+      return { nextRules, result: true };
+    });
+    return applied ? this.#rules.find((rule) => rule.id === ruleId) ?? null : null;
+  }
+
+  async #releaseMotionOwnership(deviceIds) {
+    const affectedRuleIds = this.#rules
+      .filter(
+        (rule) =>
+          rule.motionControl &&
+          rule._motionRuntime &&
+          deviceIds.has(rule.actions[0].deviceId),
+      )
+      .map((rule) => rule.id);
+    if (!affectedRuleIds.length) return false;
+    for (const ruleId of affectedRuleIds) {
+      this.#clearMotionTimer(ruleId);
+      this.#clearMotionReconcileTimer(ruleId);
+    }
+    const affected = new Set(affectedRuleIds);
+    await this.#mutate((rules) => ({
+      nextRules: rules.map((rule) => {
+        if (!affected.has(rule.id)) return rule;
+        const updated = { ...rule };
+        delete updated._motionRuntime;
+        return updated;
+      }),
+      result: true,
+    }));
+    return true;
+  }
+
+  #restoreMotionTimers() {
+    for (const rule of this.#rules) {
+      if (
+        rule.enabled &&
+        rule.motionControl &&
+        rule._motionRuntime?.phase === "clearWaiting"
+      ) {
+        this.#armMotionTimer(rule);
+      } else if (
+        rule.enabled &&
+        rule.motionControl &&
+        rule._motionRuntime?.phase === "detected"
+      ) {
+        this.#reconcileRestoredMotionSession(
+          rule.id,
+          rule._motionRuntime.revision,
+        );
+      }
+    }
+  }
+
+  async #reconcileRestoredMotionSession(ruleId, expectedRevision) {
+    if (this.#stopped) return;
+    const rule = this.#rules.find(
+      (item) =>
+        item.id === ruleId &&
+        item.enabled &&
+        item.motionControl &&
+        item._motionRuntime?.phase === "detected" &&
+        item._motionRuntime.revision === expectedRevision,
+    );
+    if (!rule) return;
+
+    try {
+      if (typeof this.#getDevice !== "function") {
+        throw new Error("Motion sensor state is unavailable.");
+      }
+      const sensor = await this.#getDevice(rule.trigger.deviceId, { fresh: true });
+      const isDetected =
+        sensor?.attributes?.isDetected ?? sensor?.isDetected;
+      const current = this.#rules.find(
+        (item) =>
+          item.id === ruleId &&
+          item.enabled &&
+          item.motionControl &&
+          item._motionRuntime?.phase === "detected" &&
+          item._motionRuntime.revision === expectedRevision,
+      );
+      if (!current) return;
+      if (isDetected === true) return;
+      if (isDetected !== false) {
+        throw new Error("Motion sensor did not report a boolean detection state.");
+      }
+
+      const nextRule = await this.#writeMotionRuntime(
+        ruleId,
+        {
+          phase: "clearWaiting",
+          openedAt: current._motionRuntime.openedAt,
+          inactivityDeadline: new Date(
+            this.#now() + current.motionControl.inactivitySeconds * 1_000,
+          ).toISOString(),
+        },
+        expectedRevision,
+      );
+      if (nextRule?._motionRuntime) this.#armMotionTimer(nextRule);
+    } catch (error) {
+      const current = this.#rules.find(
+        (item) =>
+          item.id === ruleId &&
+          item.enabled &&
+          item.motionControl &&
+          item._motionRuntime?.phase === "detected" &&
+          item._motionRuntime.revision === expectedRevision,
+      );
+      if (!current) return;
+      this.#onExecution({
+        status: "error",
+        source: "motionReconcile",
+        ruleId: current.id,
+        ruleName: current.name,
+        deviceId: current.trigger.deviceId,
+        error,
+        at: new Date().toISOString(),
+      });
+      this.#scheduleMotionReconciliation(ruleId, expectedRevision);
+    }
+  }
+
+  #scheduleMotionReconciliation(ruleId, expectedRevision) {
+    this.#clearMotionReconcileTimer(ruleId);
+    if (this.#stopped) return;
+    const timer = this.#setTimeout(() => {
+      const current = this.#motionReconcileTimers.get(ruleId);
+      if (current?.timer !== timer || current.revision !== expectedRevision) return;
+      this.#motionReconcileTimers.delete(ruleId);
+      this.#reconcileRestoredMotionSession(ruleId, expectedRevision);
+    }, MOTION_CONTROL_RETRY_MS);
+    timer.unref?.();
+    this.#motionReconcileTimers.set(ruleId, {
+      timer,
+      revision: expectedRevision,
+    });
+  }
+
+  #clearMotionReconcileTimer(ruleId) {
+    const existing = this.#motionReconcileTimers.get(ruleId);
+    if (!existing) return;
+    this.#clearTimeout(existing.timer);
+    this.#motionReconcileTimers.delete(ruleId);
+  }
+
+  #armMotionTimer(rule, delayOverride = undefined) {
+    this.#clearMotionTimer(rule.id);
+    if (
+      this.#stopped ||
+      this.#motionTimerHolds.has(rule.id) ||
+      rule._motionRuntime?.phase !== "clearWaiting"
+    ) {
+      return;
+    }
+    const deadline = Date.parse(rule._motionRuntime.inactivityDeadline);
+    const delay = delayOverride ?? Math.max(0, deadline - this.#now());
+    const revision = rule._motionRuntime.revision;
+    const timer = this.#setTimeout(() => {
+      const current = this.#motionTimers.get(rule.id);
+      if (current?.timer !== timer || current.revision !== revision) return;
+      this.#motionTimers.delete(rule.id);
+      this.#handleMotionTimeout(rule.id, revision).catch((error) => {
+        this.#onExecution({
+          status: "error",
+          source: "motionInactivity",
+          ruleId: rule.id,
+          ruleName: rule.name,
+          error,
+          at: new Date().toISOString(),
+        });
+      });
+    }, Math.max(0, delay));
+    timer.unref?.();
+    this.#motionTimers.set(rule.id, { timer, revision });
+  }
+
+  #clearMotionTimer(ruleId) {
+    const existing = this.#motionTimers.get(ruleId);
+    if (!existing) return;
+    this.#clearTimeout(existing.timer);
+    this.#motionTimers.delete(ruleId);
+  }
+
+  async #handleMotionTimeout(ruleId, expectedRevision) {
+    if (this.#motionTimerHolds.has(ruleId)) return;
+    let rule = this.#rules.find(
+      (item) =>
+        item.id === ruleId &&
+        item.enabled &&
+        item.motionControl &&
+        item._motionRuntime?.phase === "clearWaiting" &&
+        item._motionRuntime.revision === expectedRevision,
+    );
+    if (!rule) return;
+    const deadline = Date.parse(rule._motionRuntime.inactivityDeadline);
+    if (Number.isFinite(deadline) && deadline > this.#now()) {
+      this.#armMotionTimer(rule);
+      return;
+    }
+
+    const action = rule.actions[0];
+    try {
+      if (typeof this.#getDevice === "function") {
+        const device = await this.#getDevice(action.deviceId, { fresh: true });
+        if (device?.attributes?.isOn === false) {
+          await this.#writeMotionRuntime(rule.id, null, expectedRevision);
+          return;
+        }
+      }
+
+      rule = this.#rules.find((item) => item.id === ruleId);
+      if (rule?._motionRuntime?.revision !== expectedRevision) return;
+      const versionBeforeClaim =
+        this.#deviceActionVersions.get(action.deviceId) ?? 0;
+      const claimedRule = await this.#claimMotionTimeout(
+        ruleId,
+        expectedRevision,
+      );
+      if (!claimedRule?._motionRuntime) return;
+      expectedRevision = claimedRule._motionRuntime.revision;
+      rule = claimedRule;
+      if (this.#motionTimerHolds.has(ruleId)) return;
+      if (
+        (this.#deviceActionVersions.get(action.deviceId) ?? 0) !==
+        versionBeforeClaim
+      ) {
+        await this.#writeMotionRuntime(ruleId, null, expectedRevision);
+        return;
+      }
+      const actionVersion = this.#beginDeviceAction(action.deviceId);
+      await this.#setDeviceAttributes({
+        id: action.deviceId,
+        attributes: { isOn: false },
+        transitionTime: action.transitionTime,
+      });
+      if (this.#deviceActionVersions.get(action.deviceId) === actionVersion) {
+        await this.#writeMotionRuntime(rule.id, null, expectedRevision);
+      }
+      this.#onExecution({
+        status: "success",
+        source: "motionInactivity",
+        ruleId: rule.id,
+        ruleName: rule.name,
+        deviceId: action.deviceId,
+        at: new Date().toISOString(),
+      });
+    } catch (error) {
+      this.#onExecution({
+        status: "error",
+        source: "motionInactivity",
+        ruleId: rule.id,
+        ruleName: rule.name,
+        deviceId: action.deviceId,
+        error,
+        at: new Date().toISOString(),
+      });
+      const latest = this.#rules.find((item) => item.id === ruleId);
+      if (latest?._motionRuntime?.revision === expectedRevision) {
+        this.#armMotionTimer(latest, MOTION_CONTROL_RETRY_MS);
+      }
+    }
+  }
+
+  async #claimMotionTimeout(ruleId, expectedRevision) {
+    let claimed = false;
+    await this.#mutate((rules) => {
+      const index = rules.findIndex((rule) => rule.id === ruleId);
+      if (index === -1) return { nextRules: rules, result: false };
+      const current = rules[index];
+      const runtime = current._motionRuntime;
+      if (
+        !current.enabled ||
+        !current.motionControl ||
+        runtime?.phase !== "clearWaiting" ||
+        runtime.revision !== expectedRevision ||
+        this.#motionTimerHolds.has(ruleId) ||
+        Date.parse(runtime.inactivityDeadline) > this.#now()
+      ) {
+        return { nextRules: rules, result: false };
+      }
+      const updated = {
+        ...current,
+        _motionRuntime: {
+          ...runtime,
+          revision: runtime.revision + 1,
+        },
+      };
+      const nextRules = rules.slice();
+      nextRules[index] = updated;
+      claimed = true;
+      return { nextRules, result: true };
+    });
+    return claimed
+      ? this.#rules.find((rule) => rule.id === ruleId) ?? null
+      : null;
+  }
+
+  #holdMotionTimersForDevices(deviceIds) {
+    const heldRuleIds = [];
+    for (const rule of this.#rules) {
+      if (
+        !rule.motionControl ||
+        !rule._motionRuntime ||
+        !deviceIds.has(rule.actions[0].deviceId)
+      ) {
+        continue;
+      }
+      this.#clearMotionTimer(rule.id);
+      this.#motionTimerHolds.set(
+        rule.id,
+        (this.#motionTimerHolds.get(rule.id) ?? 0) + 1,
+      );
+      heldRuleIds.push(rule.id);
+    }
+    return heldRuleIds;
+  }
+
+  #releaseMotionTimerHolds(ruleIds) {
+    for (const ruleId of ruleIds) {
+      const count = this.#motionTimerHolds.get(ruleId) ?? 0;
+      if (count > 1) {
+        this.#motionTimerHolds.set(ruleId, count - 1);
+        continue;
+      }
+      this.#motionTimerHolds.delete(ruleId);
+      const rule = this.#rules.find((item) => item.id === ruleId);
+      if (rule?._motionRuntime?.phase === "clearWaiting") {
+        this.#armMotionTimer(rule);
+      }
+    }
+  }
+
   async #executeBlinkEffect(rule) {
+    const heldMotionRules = this.#holdMotionTimersForDevices(
+      new Set(rule.actions.map((action) => action.deviceId)),
+    );
+    try {
+      return await this.#executeBlinkEffectWhileTimersHeld(rule);
+    } finally {
+      this.#releaseMotionTimerHolds(heldMotionRules);
+    }
+  }
+
+  async #executeBlinkEffectWhileTimersHeld(rule) {
     const failures = [];
     if (typeof this.#getDevice !== "function") {
       const error = new Error("Device snapshots are unavailable for the blink effect.");
@@ -1478,6 +2267,8 @@ export class RuleEngine {
   }
 
   #clearRuleTimers(ruleId) {
+    this.#clearMotionTimer(ruleId);
+    this.#clearMotionReconcileTimer(ruleId);
     for (const [deviceId, entry] of this.#offTimers) {
       if (entry.ruleId === ruleId) {
         clearTimeout(entry.timer);
@@ -1492,6 +2283,15 @@ export class RuleEngine {
     this.#scheduleTimer = null;
     for (const entry of this.#offTimers.values()) clearTimeout(entry.timer);
     this.#offTimers.clear();
+    for (const entry of this.#motionTimers.values()) {
+      this.#clearTimeout(entry.timer);
+    }
+    this.#motionTimers.clear();
+    for (const entry of this.#motionReconcileTimers.values()) {
+      this.#clearTimeout(entry.timer);
+    }
+    this.#motionReconcileTimers.clear();
+    this.#motionTimerHolds.clear();
     this.#pendingEvents.clear();
   }
 }

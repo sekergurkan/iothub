@@ -99,6 +99,12 @@ type AutomationEffect = {
   restoreState: true;
 };
 
+type MotionControl = {
+  mode: "entryExit";
+  minimumOnSeconds: number;
+  inactivitySeconds: number;
+};
+
 type SmartDevice = {
   id: string;
   name: string;
@@ -156,6 +162,7 @@ type AutomationRule = {
   };
   actions: AutomationAction[];
   effect?: AutomationEffect;
+  motionControl?: MotionControl;
   offAfterSeconds?: number;
   cooldownSeconds?: number;
   lastRun?: string;
@@ -767,7 +774,9 @@ function describeRule(rule: AutomationRule, devices: SmartDevice[]) {
   const triggerDevice = devices.find((device) => device.id === rule.trigger.deviceId)?.name;
   let trigger = "Belirlenen anda";
   if (rule.trigger.type === "motion" || rule.trigger.type === "occupancy") {
-    trigger = `${triggerDevice || "Sensör"} ${rule.trigger.isDetected === false ? "hareket kesildiğinde" : "hareket algıladığında"}`;
+    trigger = rule.motionControl?.mode === "entryExit"
+      ? `${triggerDevice || "Sensör"} giriş veya çıkış hareketi algıladığında`
+      : `${triggerDevice || "Sensör"} ${rule.trigger.isDetected === false ? "hareket kesildiğinde" : "hareket algıladığında"}`;
   }
   if (rule.trigger.type === "button") {
     const click =
@@ -815,6 +824,16 @@ function describeRule(rule: AutomationRule, devices: SmartDevice[]) {
   if (rule.effect?.type === "blink") {
     const intervalSeconds = rule.effect.intervalMilliseconds / 1_000;
     return `${trigger}${filters.length ? `; yalnızca ${filters.join(" ve ")}` : ""}. ${rule.actions.length} ışık ${rule.effect.durationSeconds} sn boyunca ${intervalSeconds} sn aralıklarla yanıp sönsün ve önceki durumuna dönsün.${rule.cooldownSeconds ? ` Yeniden çalışmadan önce ${Math.round(rule.cooldownSeconds / 60)} dk bekler.` : ""}`;
+  }
+
+  if (rule.motionControl?.mode === "entryExit") {
+    const target = rule.actions[0]
+      ? devices.find((device) => device.id === rule.actions[0].deviceId)?.name || "Seçili ışık"
+      : "Seçili ışık";
+    const inactivity = rule.motionControl.inactivitySeconds % 60 === 0
+      ? `${rule.motionControl.inactivitySeconds / 60} dk`
+      : `${rule.motionControl.inactivitySeconds} sn`;
+    return `${trigger}${filters.length ? `; yalnızca ${filters.join(" ve ")}` : ""}. ${target} girişte açılsın; en az ${rule.motionControl.minimumOnSeconds} sn sonra algılanan sonraki harekette kapansın. Çıkış algılanmazsa ${inactivity} hareketsizlik sonunda güvenli biçimde kapansın.`;
   }
 
   return `${trigger}${filters.length ? `; yalnızca ${filters.join(" ve ")}` : ""}. ${actions.join("; ")}.${rule.cooldownSeconds ? ` Yeniden çalışmadan önce ${Math.round(rule.cooldownSeconds / 60)} dk bekler.` : ""}`;
@@ -1189,7 +1208,8 @@ export function HomeControl() {
   }
 
   function testRule(rule: AutomationRule) {
-    if (rule.effect?.type === "blink") {
+    const requiresBackendRun = rule.effect?.type === "blink" || rule.motionControl?.mode === "entryExit";
+    if (requiresBackendRun) {
       const savedRule = rules.find((item) => item.id === rule.id);
       const executionSignature = (candidate: AutomationRule) => JSON.stringify({
         enabled: candidate.enabled,
@@ -1197,15 +1217,16 @@ export function HomeControl() {
         conditions: candidate.conditions,
         actions: candidate.actions,
         effect: candidate.effect,
+        motionControl: candidate.motionControl,
         cooldownSeconds: candidate.cooldownSeconds,
       });
       if (mode !== "bridge" || !savedRule || executionSignature(savedRule) !== executionSignature(rule)) {
-        showToast("Yanıp sönme efektini test etmek için önce kuralı kaydet");
+        showToast(rule.motionControl ? "Giriş/çıkış davranışını test etmek için önce kuralı kaydet" : "Yanıp sönme efektini test etmek için önce kuralı kaydet");
         return;
       }
-      showToast(`“${rule.name}” uyarı testi başlatılıyor`);
+      showToast(`“${rule.name}” ${rule.motionControl ? "giriş/çıkış" : "uyarı"} testi başlatılıyor`);
       bridgeFetch(`/api/rules/${encodeURIComponent(rule.id)}/run`, { method: "POST" })
-        .then(() => showToast(`“${rule.name}” uyarı testi tamamlandı`))
+        .then(() => showToast(`“${rule.name}” ${rule.motionControl ? "giriş/çıkış" : "uyarı"} testi tamamlandı`))
         .catch((error) => {
           showToast(error instanceof Error ? `Kural test edilemedi: ${error.message}` : "Kural test edilemedi");
           syncBridge().catch(() => setBridgeOnline(false));
@@ -1894,6 +1915,10 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
   const [triggerType, setTriggerType] = useState<TriggerType>(initialRule?.trigger.type === "occupancy" ? "motion" : initialRule?.trigger.type || "motion");
   const [triggerDevice, setTriggerDevice] = useState(initialRule?.trigger.deviceId || sensors[0]?.id || "");
   const [motionDetected, setMotionDetected] = useState(initialRule?.trigger.isDetected ?? true);
+  const initialMotionControl = initialRule?.motionControl?.mode === "entryExit" ? initialRule.motionControl : null;
+  const [entryExitEnabled, setEntryExitEnabled] = useState(Boolean(initialMotionControl));
+  const [minimumOnSeconds, setMinimumOnSeconds] = useState(initialMotionControl?.minimumOnSeconds ?? 10);
+  const [motionInactivitySeconds, setMotionInactivitySeconds] = useState(initialMotionControl?.inactivitySeconds ?? 300);
   const [clickPattern, setClickPattern] = useState<ClickPattern>(initialRule?.trigger.clickPattern || "singlePress");
   const [triggerTime, setTriggerTime] = useState(initialRule?.trigger.time || "20:00");
   const existingDays = initialRule?.conditions.days?.length ? initialRule.conditions.days : initialRule?.trigger.days;
@@ -1951,10 +1976,17 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
   );
   const lightIds = new Set(lights.map((light) => light.id));
   const initialBlinkTargetIds = new Set(initialBlinkEffect ? initialRule?.actions.map((action) => action.deviceId) : []);
-  const targetDevices = blinkEnabled ? controllableDevices.filter((device) => device.type === "light") : controllableDevices;
-  const visibleActionEditors = blinkEnabled
-    ? actionEditors.filter((action) => lightIds.has(action.deviceId) || initialBlinkTargetIds.has(action.deviceId))
-    : actionEditors;
+  const entryExitActive = triggerType === "motion" && entryExitEnabled;
+  const targetDevices = entryExitActive
+    ? lights
+    : blinkEnabled
+      ? controllableDevices.filter((device) => device.type === "light")
+      : controllableDevices;
+  const visibleActionEditors = entryExitActive
+    ? actionEditors.slice(0, 1)
+    : blinkEnabled
+      ? actionEditors.filter((action) => lightIds.has(action.deviceId) || initialBlinkTargetIds.has(action.deviceId))
+      : actionEditors;
 
   const createBulkAction = (deviceId: string): ActionEditorState => {
     const device = controllableDevices.find((item) => item.id === deviceId);
@@ -1973,8 +2005,26 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
     };
   };
 
+  function configureEntryExit(nextEnabled: boolean) {
+    setEntryExitEnabled(nextEnabled);
+    if (!nextEnabled) return;
+    setMotionDetected(true);
+    setBlinkEnabled(false);
+    setCooldownEnabled(false);
+    setBulkOn(true);
+    setBulkAutoOffEnabled(false);
+    setActionEditors((current) => {
+      const selected = current.find((action) => lightIds.has(action.deviceId));
+      const nextAction = selected || (lights[0] ? createBulkAction(lights[0].id) : null);
+      return nextAction
+        ? [{ ...nextAction, isOn: true, autoOffEnabled: false, passthroughAttributes: undefined }]
+        : [];
+    });
+  }
+
   function selectTriggerType(nextType: TriggerType) {
     setTriggerType(nextType);
+    if (nextType === "motion" && entryExitEnabled) configureEntryExit(true);
     const options = nextType === "motion" ? sensors : nextType === "button" ? buttons : nextType === "deviceEvent" ? cameras : [];
     if (nextType !== "time" && !options.some((device) => device.id === triggerDevice)) {
       setTriggerDevice(options[0]?.id || "");
@@ -1987,6 +2037,10 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
 
   function toggleActionDevice(deviceId: string) {
     setActionEditors((current) => {
+      if (entryExitActive) {
+        if (current[0]?.deviceId === deviceId) return [];
+        return [{ ...createBulkAction(deviceId), isOn: true, autoOffEnabled: false, passthroughAttributes: undefined }];
+      }
       if (current.some((action) => action.deviceId === deviceId)) return current.filter((action) => action.deviceId !== deviceId);
       const activeCount = blinkEnabled
         ? current.filter((action) => lightIds.has(action.deviceId) || initialBlinkTargetIds.has(action.deviceId)).length
@@ -2093,18 +2147,18 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
     });
   }
 
-  const actions: AutomationAction[] = visibleActionEditors.map((action) => blinkEnabled
+  const actions: AutomationAction[] = visibleActionEditors.map((action) => blinkEnabled && !entryExitActive
     ? { deviceId: action.deviceId, isOn: true }
     : {
         deviceId: action.deviceId,
-        ...(action.isOn !== undefined ? { isOn: action.isOn } : {}),
-        ...(action.passthroughAttributes && Object.keys(action.passthroughAttributes).length
+        ...(entryExitActive ? { isOn: true } : action.isOn !== undefined ? { isOn: action.isOn } : {}),
+        ...(!entryExitActive && action.passthroughAttributes && Object.keys(action.passthroughAttributes).length
           ? { attributes: action.passthroughAttributes }
           : {}),
         ...(action.isOn !== false && action.brightnessEnabled ? { brightness: Math.round(action.brightness) } : {}),
         ...(action.isOn !== false && action.temperatureEnabled ? { temperature: Math.round(action.temperature) } : {}),
         ...(action.transitionEnabled ? { transitionTime: Math.round(action.transitionSeconds * 1000) } : {}),
-        ...(action.isOn && action.autoOffEnabled ? { offAfterSeconds: Math.round(action.autoOffMinutes * 60) } : {}),
+        ...(!entryExitActive && action.isOn && action.autoOffEnabled ? { offAfterSeconds: Math.round(action.autoOffMinutes * 60) } : {}),
       });
 
   const draft: AutomationRule = {
@@ -2114,7 +2168,7 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
     trigger: {
       type: triggerType,
       ...(triggerType !== "time" ? { deviceId: triggerDevice } : {}),
-      ...(triggerType === "motion" ? { isDetected: motionDetected } : {}),
+      ...(triggerType === "motion" ? { isDetected: entryExitActive ? true : motionDetected } : {}),
       ...(triggerType === "button" ? { clickPattern } : {}),
       ...(triggerType === "time" ? { time: triggerTime } : {}),
       ...(triggerType === "deviceEvent" ? { eventType: "babyCry" } : {}),
@@ -2127,7 +2181,14 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
         : {}),
     },
     actions,
-    ...(blinkEnabled ? {
+    ...(entryExitActive ? {
+      motionControl: {
+        mode: "entryExit",
+        minimumOnSeconds: Math.round(minimumOnSeconds),
+        inactivitySeconds: Math.round(motionInactivitySeconds),
+      } satisfies MotionControl,
+    } : {}),
+    ...(blinkEnabled && !entryExitActive ? {
       effect: {
         type: "blink",
         durationSeconds: Math.round(blinkDurationSeconds),
@@ -2135,7 +2196,7 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
         restoreState: true,
       } satisfies AutomationEffect,
     } : {}),
-    ...(cooldownEnabled ? { cooldownSeconds: Math.round(cooldownMinutes * 60) } : {}),
+    ...(cooldownEnabled && !entryExitActive ? { cooldownSeconds: Math.round(cooldownMinutes * 60) } : {}),
     lastRun: initialRule?.lastRun,
     runCount: initialRule?.runCount ?? 0,
   };
@@ -2148,6 +2209,8 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
     }
     if (targetStep === 2) {
       if (triggerType === "motion" && !sensors.some((device) => device.id === triggerDevice)) errors.push("Bir hareket sensörü seçmelisin.");
+      if (entryExitActive && (!Number.isInteger(minimumOnSeconds) || minimumOnSeconds < 10 || minimumOnSeconds > 3_600)) errors.push("Giriş/çıkış için minimum açık kalma süresi 10–3600 saniye arasında tam sayı olmalı.");
+      if (entryExitActive && (!Number.isInteger(motionInactivitySeconds) || motionInactivitySeconds < 1 || motionInactivitySeconds > 86_400)) errors.push("Güvenli kapanma süresi 1 saniye–1440 dakika arasında olmalı.");
       if (triggerType === "button" && !buttons.some((device) => device.id === triggerDevice)) errors.push("Bir buton veya tuş seçmelisin.");
       if (triggerType === "deviceEvent" && !cameras.some((device) => device.id === triggerDevice)) errors.push("Bebek ağlamasını izleyecek bir kamera seçmelisin.");
       if (triggerType === "time" && !/^([01]\d|2[0-3]):[0-5]\d$/.test(triggerTime)) errors.push("Geçerli bir çalışma saati seçmelisin.");
@@ -2170,17 +2233,18 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
       if (cooldownEnabled && (!Number.isFinite(cooldownMinutes) || cooldownMinutes <= 0 || cooldownMinutes > 1440)) errors.push("Bekleme süresi 1–1440 dakika arasında olmalı.");
     }
     if (targetStep === 4) {
-      if (visibleActionEditors.length === 0) errors.push(blinkEnabled ? "Yanıp sönme uyarısı için en az bir ışık seçmelisin." : "Kuralın çalıştıracağı en az bir cihaz seçmelisin.");
-      if (visibleActionEditors.length > 32) errors.push("Bir kurala en fazla 32 cihaz ekleyebilirsin.");
-      if (blinkEnabled && (!Number.isInteger(blinkDurationSeconds) || blinkDurationSeconds < 1 || blinkDurationSeconds > 60)) errors.push("Yanıp sönme süresi 1–60 saniye arasında tam sayı olmalı.");
-      if (blinkEnabled && (!Number.isInteger(blinkIntervalMilliseconds) || blinkIntervalMilliseconds < 100 || blinkIntervalMilliseconds > 2_000)) errors.push("Yanıp sönme aralığı 100–2000 ms arasında tam sayı olmalı.");
-      if (blinkEnabled && Number.isInteger(blinkDurationSeconds) && Number.isInteger(blinkIntervalMilliseconds) && blinkDurationSeconds * 1_000 < blinkIntervalMilliseconds * 2) errors.push("Yanıp sönme süresi en az bir tam aç/kapat döngüsüne izin vermeli.");
-      if (!blinkEnabled && actionEditors.some((action) => action.isOn !== false && action.brightnessEnabled && (!Number.isFinite(action.brightness) || action.brightness < 1 || action.brightness > 100))) errors.push("Parlaklık değerleri %1–%100 arasında olmalı.");
-      if (!blinkEnabled && actionEditors.some((action) => action.isOn !== false && action.temperatureEnabled && (!Number.isFinite(action.temperature) || action.temperature < 1500 || action.temperature > 6500))) errors.push("Renk sıcaklığı 1500K–6500K arasında olmalı.");
+      if (visibleActionEditors.length === 0) errors.push(entryExitActive ? "Giriş/çıkış davranışı için bir ışık seçmelisin." : blinkEnabled ? "Yanıp sönme uyarısı için en az bir ışık seçmelisin." : "Kuralın çalıştıracağı en az bir cihaz seçmelisin.");
+      if (entryExitActive && (visibleActionEditors.length !== 1 || devices.find((device) => device.id === visibleActionEditors[0]?.deviceId)?.type !== "light")) errors.push("Giriş/çıkış davranışı yalnızca tek bir ışığı yönetebilir.");
+      if (!entryExitActive && visibleActionEditors.length > 32) errors.push("Bir kurala en fazla 32 cihaz ekleyebilirsin.");
+      if (!entryExitActive && blinkEnabled && (!Number.isInteger(blinkDurationSeconds) || blinkDurationSeconds < 1 || blinkDurationSeconds > 60)) errors.push("Yanıp sönme süresi 1–60 saniye arasında tam sayı olmalı.");
+      if (!entryExitActive && blinkEnabled && (!Number.isInteger(blinkIntervalMilliseconds) || blinkIntervalMilliseconds < 100 || blinkIntervalMilliseconds > 2_000)) errors.push("Yanıp sönme aralığı 100–2000 ms arasında tam sayı olmalı.");
+      if (!entryExitActive && blinkEnabled && Number.isInteger(blinkDurationSeconds) && Number.isInteger(blinkIntervalMilliseconds) && blinkDurationSeconds * 1_000 < blinkIntervalMilliseconds * 2) errors.push("Yanıp sönme süresi en az bir tam aç/kapat döngüsüne izin vermeli.");
+      if (!blinkEnabled && actionEditors.some((action) => (entryExitActive || action.isOn !== false) && action.brightnessEnabled && (!Number.isFinite(action.brightness) || action.brightness < 1 || action.brightness > 100))) errors.push("Parlaklık değerleri %1–%100 arasında olmalı.");
+      if (!blinkEnabled && actionEditors.some((action) => (entryExitActive || action.isOn !== false) && action.temperatureEnabled && (!Number.isFinite(action.temperature) || action.temperature < 1500 || action.temperature > 6500))) errors.push("Renk sıcaklığı 1500K–6500K arasında olmalı.");
       if (!blinkEnabled && actionEditors.some((action) => action.transitionEnabled && (!Number.isFinite(action.transitionSeconds) || action.transitionSeconds < 0 || action.transitionSeconds > 600))) errors.push("Geçiş süresi 0–600 saniye arasında olmalı.");
-      if (!blinkEnabled && actionEditors.some((action) => action.isOn && action.autoOffEnabled && (!Number.isFinite(action.autoOffMinutes) || action.autoOffMinutes <= 0 || action.autoOffMinutes > 1440))) errors.push("Otomatik kapanma süresi 1–1440 dakika arasında olmalı.");
-      if (!blinkEnabled && actionEditors.some((action) => typeof action.passthroughAttributes?.percentage === "number" && (action.passthroughAttributes.percentage < 0 || action.passthroughAttributes.percentage > 100))) errors.push("Fan seviyesi %0–%100 arasında olmalı.");
-      if (!blinkEnabled && actionEditors.some((action) => typeof action.passthroughAttributes?.targetHumidity === "number" && (action.passthroughAttributes.targetHumidity < 30 || action.passthroughAttributes.targetHumidity > 80))) errors.push("Hedef nem %30–%80 arasında olmalı.");
+      if (!entryExitActive && !blinkEnabled && actionEditors.some((action) => action.isOn && action.autoOffEnabled && (!Number.isFinite(action.autoOffMinutes) || action.autoOffMinutes <= 0 || action.autoOffMinutes > 1440))) errors.push("Otomatik kapanma süresi 1–1440 dakika arasında olmalı.");
+      if (!entryExitActive && !blinkEnabled && actionEditors.some((action) => typeof action.passthroughAttributes?.percentage === "number" && (action.passthroughAttributes.percentage < 0 || action.passthroughAttributes.percentage > 100))) errors.push("Fan seviyesi %0–%100 arasında olmalı.");
+      if (!entryExitActive && !blinkEnabled && actionEditors.some((action) => typeof action.passthroughAttributes?.targetHumidity === "number" && (action.passthroughAttributes.targetHumidity < 30 || action.passthroughAttributes.targetHumidity > 80))) errors.push("Hedef nem %30–%80 arasında olmalı.");
     }
     return errors;
   }
@@ -2188,8 +2252,11 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
   const allErrors = [1, 2, 3, 4].flatMap(errorsForStep);
   const currentErrors = step === 5 ? allErrors : errorsForStep(step);
   const progressSteps = ["Temel bilgiler", "Tetikleyici", "Koşullar", "Eylemler", "Kontrol"];
+  const motionInactivitySummary = motionInactivitySeconds % 60 === 0
+    ? `${motionInactivitySeconds / 60} dk`
+    : `${motionInactivitySeconds} sn`;
   const triggerSummary = triggerType === "motion"
-    ? `${devices.find((device) => device.id === triggerDevice)?.name || "Sensör"} · ${motionDetected ? "hareket algılandı" : "hareket sona erdi"}`
+    ? `${devices.find((device) => device.id === triggerDevice)?.name || "Sensör"} · ${entryExitActive ? `girişte aç / çıkışta kapat · en az ${minimumOnSeconds} sn açık` : motionDetected ? "hareket algılandı" : "hareket sona erdi"}`
     : triggerType === "button"
       ? `${devices.find((device) => device.id === triggerDevice)?.name || "Buton"} · ${clickPattern === "doublePress" ? "çift basış" : clickPattern === "longPress" ? "uzun basış" : "tek basış"}`
       : triggerType === "deviceEvent"
@@ -2238,7 +2305,14 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
               </div></fieldset>
               {triggerType === "motion" && <>
                 <label className="field"><span>Hareket sensörü <em>zorunlu</em></span><select value={triggerDevice} onChange={(event) => setTriggerDevice(event.target.value)}><option value="">Sensör seç</option>{sensors.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.room}</option>)}</select></label>
-                <fieldset><legend>Hangi değişiklikte?</legend><div className="segmented"><button type="button" className={motionDetected ? "selected" : ""} onClick={() => setMotionDetected(true)}>Hareket algılandı</button><button type="button" className={!motionDetected ? "selected" : ""} onClick={() => setMotionDetected(false)}>Hareket sona erdi</button></div></fieldset>
+                <fieldset><legend>Hareket davranışı</legend><div className="segmented"><button type="button" className={!entryExitEnabled ? "selected" : ""} onClick={() => configureEntryExit(false)}>Tek hareket olayı</button><button type="button" className={entryExitEnabled ? "selected" : ""} onClick={() => configureEntryExit(true)}>Girişte aç / çıkışta kapat</button></div></fieldset>
+                {entryExitActive ? <>
+                  <div className="two-column-fields">
+                    <label className="field compact-number"><span>Minimum açık kalma</span><div><input type="number" min="10" max="3600" step="1" value={minimumOnSeconds} onChange={(event) => setMinimumOnSeconds(Number(event.target.value))} /><em>saniye</em></div><small>Bu süreden önceki hareketler çıkış kabul edilmez.</small></label>
+                    <label className="field compact-number"><span>Hareketsizlikte güvenli kapanma</span><div><input type="number" min="1" max="1440" step="1" value={motionInactivitySeconds / 60} onChange={(event) => setMotionInactivitySeconds(Math.round(Number(event.target.value) * 60))} /><em>dakika</em></div><small>Çıkış algılanmazsa ışık en geç bu sürede kapanır.</small></label>
+                  </div>
+                  <div className="condition-note"><Info size={17} /><p>İlk ayrı hareket ışığı açar. En az {minimumOnSeconds || 10} saniye sonra algılanan sonraki hareket çıkış kabul edilip ışığı kapatır; yanıp sönme, ek bekleme ve ayrı otomatik kapatma kullanılmaz.</p></div>
+                </> : <fieldset><legend>Hangi değişiklikte?</legend><div className="segmented"><button type="button" className={motionDetected ? "selected" : ""} onClick={() => setMotionDetected(true)}>Hareket algılandı</button><button type="button" className={!motionDetected ? "selected" : ""} onClick={() => setMotionDetected(false)}>Hareket sona erdi</button></div></fieldset>}
               </>}
               {triggerType === "button" && <div className="two-column-fields">
                 <label className="field"><span>Buton / tuş <em>zorunlu</em></span><select value={triggerDevice} onChange={(event) => setTriggerDevice(event.target.value)}><option value="">Buton seç</option>{buttons.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.room}</option>)}</select></label>
@@ -2261,9 +2335,11 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
                   <div className="time-pair"><label className="field"><span>Başlangıç</span><input type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} /></label><span>—</span><label className="field"><span>Bitiş</span><input type="time" value={endTime} onChange={(event) => setEndTime(event.target.value)} /></label></div>
                   <div className="condition-note"><Info size={17} /><p>Örn. 22:00–06:00 aralığı gece yarısından sonra ertesi güne devam eder.</p></div>
                 </OptionalSetting>
-                <OptionalSetting enabled={cooldownEnabled} title="Tekrar çalışma beklemesi" copy="Peş peşe gelen olaylarda aynı kuralın çok sık çalışmasını önle." onToggle={() => setCooldownEnabled((current) => !current)}>
-                  <label className="field compact-number"><span>Bekleme süresi</span><div><input type="number" min="1" max="1440" value={cooldownMinutes} onChange={(event) => setCooldownMinutes(Number(event.target.value))} /><em>dakika</em></div></label>
-                </OptionalSetting>
+                {entryExitActive
+                  ? <div className="condition-note"><Info size={17} /><p>Giriş/çıkış kuralında tekrar çalışma beklemesini minimum açık kalma süresi yönetir.</p></div>
+                  : <OptionalSetting enabled={cooldownEnabled} title="Tekrar çalışma beklemesi" copy="Peş peşe gelen olaylarda aynı kuralın çok sık çalışmasını önle." onToggle={() => setCooldownEnabled((current) => !current)}>
+                      <label className="field compact-number"><span>Bekleme süresi</span><div><input type="number" min="1" max="1440" value={cooldownMinutes} onChange={(event) => setCooldownMinutes(Number(event.target.value))} /><em>dakika</em></div></label>
+                    </OptionalSetting>}
                 <OptionalSetting enabled={deviceConditionsEnabled} title="Cihaz durumu koşulları" copy="Tüm satırlar doğruysa eylemleri çalıştır." onToggle={toggleDeviceConditions}>
                   <div className="device-condition-list">
                     {deviceConditions.map((condition, index) => {
@@ -2288,8 +2364,8 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
             </>}
 
             {step === 4 && <>
-              <div className="builder-section-heading"><span className="soft-icon"><SlidersHorizontal size={19} /></span><div><h3>Bir veya daha fazla cihazı yönet</h3><p>{blinkEnabled ? "Seçtiğin ışıklar birlikte yanıp söner ve başlangıçtaki açık/kapalı durumlarına döner." : "Işıkları, hava temizleyiciyi ve nem cihazını aynı yerel kuralda çalıştırabilirsin."}</p></div></div>
-              <div className="optional-settings-list action-effect-settings">
+              <div className="builder-section-heading"><span className="soft-icon"><SlidersHorizontal size={19} /></span><div><h3>{entryExitActive ? "Giriş ve çıkışta yönetilecek ışığı seç" : "Bir veya daha fazla cihazı yönet"}</h3><p>{entryExitActive ? "Bu davranış tek bir ışığı girişte açar, çıkışta kapatır ve hareketsizlik süresini güvenlik ağı olarak kullanır." : blinkEnabled ? "Seçtiğin ışıklar birlikte yanıp söner ve başlangıçtaki açık/kapalı durumlarına döner." : "Işıkları, hava temizleyiciyi ve nem cihazını aynı yerel kuralda çalıştırabilirsin."}</p></div></div>
+              {!entryExitActive && <div className="optional-settings-list action-effect-settings">
                 <OptionalSetting enabled={blinkEnabled} title="Yanıp sönerek uyar" copy="Seçili ışıkları aynı anda yanıp söndür ve sonra önceki durumlarına döndür." onToggle={() => setBlinkEnabled((current) => !current)}>
                   <div className="two-column-fields">
                     <label className="field compact-number"><span>Toplam süre</span><div><input type="number" min="1" max="60" step="1" value={blinkDurationSeconds} onChange={(event) => setBlinkDurationSeconds(Number(event.target.value))} /><em>saniye</em></div></label>
@@ -2297,17 +2373,17 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
                   </div>
                   <div className="condition-note"><Info size={17} /><p>Varsayılan 5 saniye ve 500 ms aralıkla tüm ışıklar birlikte uyarı verir. Süre bitince başlangıçta açık olan açık, kapalı olan kapalı kalır.</p></div>
                 </OptionalSetting>
-              </div>
+              </div>}
               <section className="target-picker">
-                <div className="target-picker-head"><span><b>{blinkEnabled ? "Uyarı ışıkları" : "Hedef cihazlar"}</b><small>{visibleActionEditors.length} cihaz seçili · en az bir seçim gerekli</small></span><button type="button" onClick={selectAllLights}>{lights.length > 0 && lights.every((light) => actionEditors.some((action) => action.deviceId === light.id)) ? "Işık seçimini temizle" : "Tüm ışıkları seç"}</button></div>
-                <div className="target-room-actions"><span>Odaya göre:</span>{Array.from(new Set(targetDevices.map((device) => device.room))).map((room) => { const roomTargets = targetDevices.filter((device) => device.room === room); const roomSelected = roomTargets.length > 0 && roomTargets.every((device) => actionEditors.some((action) => action.deviceId === device.id)); return <button type="button" key={room} className={roomSelected ? "selected" : ""} onClick={() => selectRoomTargets(room)}>{room} <small>{roomTargets.length}</small></button>; })}</div>
+                <div className="target-picker-head"><span><b>{entryExitActive ? "Giriş/çıkış ışığı" : blinkEnabled ? "Uyarı ışıkları" : "Hedef cihazlar"}</b><small>{visibleActionEditors.length} cihaz seçili · {entryExitActive ? "tam olarak bir ışık gerekli" : "en az bir seçim gerekli"}</small></span>{!entryExitActive && <button type="button" onClick={selectAllLights}>{lights.length > 0 && lights.every((light) => actionEditors.some((action) => action.deviceId === light.id)) ? "Işık seçimini temizle" : "Tüm ışıkları seç"}</button>}</div>
+                {!entryExitActive && <div className="target-room-actions"><span>Odaya göre:</span>{Array.from(new Set(targetDevices.map((device) => device.room))).map((room) => { const roomTargets = targetDevices.filter((device) => device.room === room); const roomSelected = roomTargets.length > 0 && roomTargets.every((device) => actionEditors.some((action) => action.deviceId === device.id)); return <button type="button" key={room} className={roomSelected ? "selected" : ""} onClick={() => selectRoomTargets(room)}>{room} <small>{roomTargets.length}</small></button>; })}</div>}
                 <div className="target-device-grid">{targetDevices.map((device) => {
                   const selected = actionEditors.some((action) => action.deviceId === device.id);
                   return <button type="button" key={device.id} className={selected ? "selected" : ""} onClick={() => toggleActionDevice(device.id)}><span className="target-check">{selected && <Check size={14} />}</span><span className={`target-device-glyph ${device.type}`}><DeviceGlyph type={device.type} size={15} /></span><span><b>{device.name}</b><small>{device.room} · {device.online ? "çevrimiçi" : "çevrimdışı"}</small></span></button>;
                 })}</div>
-                {!targetDevices.length && <div className="builder-empty"><SlidersHorizontal size={20} /><span>{blinkEnabled ? "Yanıp sönme uyarısında kullanılabilecek bir ışık bulunamadı." : "Kontrol edilebilir bir cihaz bulunamadı."}</span></div>}
+                {!targetDevices.length && <div className="builder-empty"><SlidersHorizontal size={20} /><span>{entryExitActive ? "Giriş/çıkış davranışında kullanılabilecek bir ışık bulunamadı." : blinkEnabled ? "Yanıp sönme uyarısında kullanılabilecek bir ışık bulunamadı." : "Kontrol edilebilir bir cihaz bulunamadı."}</span></div>}
               </section>
-              {!blinkEnabled && <section className="bulk-action-card">
+              {!blinkEnabled && !entryExitActive && <section className="bulk-action-card">
                 <div className="bulk-action-title"><span><b>Toplu eylem ayarı</b><small>Aç/kapat tüm seçili cihazlara; parlaklık, sıcaklık ve geçiş yalnızca destekleyen ışıklara uygulanır.</small></span><div className="segmented"><button type="button" className={bulkOn ? "selected" : ""} onClick={() => setBulkOn(true)}>Aç</button><button type="button" className={!bulkOn ? "selected" : ""} onClick={() => setBulkOn(false)}>Kapat</button></div></div>
                 <div className="bulk-options">
                   <label className={!bulkOn ? "is-disabled" : ""}><input type="checkbox" checked={bulkOn && bulkBrightnessEnabled} disabled={!bulkOn} onChange={(event) => setBulkBrightnessEnabled(event.target.checked)} /><span>Parlaklık</span>{bulkOn && bulkBrightnessEnabled && <input type="number" min="1" max="100" value={bulkBrightness} onChange={(event) => setBulkBrightness(Number(event.target.value))} />}{bulkOn && bulkBrightnessEnabled && <em>%</em>}</label>
@@ -2321,20 +2397,22 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
                 {visibleActionEditors.map((action) => {
                   const device = devices.find((item) => item.id === action.deviceId);
                   return <article className="device-action-card" key={action.deviceId}>
-                    <header><span className={`device-type-icon ${device?.type || "light"}`}><DeviceGlyph type={device?.type || "light"} size={18} /></span><span><b>{device?.name || "Bilinmeyen cihaz"}</b><small>{device?.room || "Odasız"} · {blinkEnabled ? "uyarı grubunda" : "bu cihaza özel ayarlar"}</small></span><button type="button" aria-label={`${device?.name || "Cihaz"} eylemini kaldır`} onClick={() => toggleActionDevice(action.deviceId)}><X size={16} /></button></header>
+                    <header><span className={`device-type-icon ${device?.type || "light"}`}><DeviceGlyph type={device?.type || "light"} size={18} /></span><span><b>{device?.name || "Bilinmeyen cihaz"}</b><small>{device?.room || "Odasız"} · {entryExitActive ? "girişte aç · çıkışta kapat" : blinkEnabled ? "uyarı grubunda" : "bu cihaza özel ayarlar"}</small></span><button type="button" aria-label={`${device?.name || "Cihaz"} eylemini kaldır`} onClick={() => toggleActionDevice(action.deviceId)}><X size={16} /></button></header>
                     {!device && <p className="action-advanced-note">Bu hedef mevcut panel cihaz listesinde görünmüyor. Eylem birebir korunur; istersen kartı kaldırabilirsin.</p>}
-                    {blinkEnabled ? <p className="action-advanced-note">Işık, grubun diğer hedefleriyle birlikte yanıp söner; efekt sonunda başlangıçtaki açık/kapalı durumuna geri döner.</p> : <>
-                      <div className="device-action-mode segmented three"><button type="button" className={action.isOn === true ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: true })}>Aç</button><button type="button" className={action.isOn === false ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: false })}>Kapat</button><button type="button" className={action.isOn === undefined ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: undefined, autoOffEnabled: false })}>Durumu koru</button></div>
-                      {action.passthroughAttributes && !["airPurifier", "dehumidifier"].includes(device?.type || "") && <p className="action-advanced-note">{Object.keys(action.passthroughAttributes).length} gelişmiş cihaz özniteliği değiştirilmeden korunacak.</p>}
+                    {blinkEnabled && !entryExitActive ? <p className="action-advanced-note">Işık, grubun diğer hedefleriyle birlikte yanıp söner; efekt sonunda başlangıçtaki açık/kapalı durumuna geri döner.</p> : <>
+                      {entryExitActive
+                        ? <p className="action-advanced-note">Aç/kapat yönünü giriş/çıkış durumu belirler. Buradaki parlaklık, renk ve geçiş ayarları yalnızca girişte ışık açılırken uygulanır.</p>
+                        : <div className="device-action-mode segmented three"><button type="button" className={action.isOn === true ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: true })}>Aç</button><button type="button" className={action.isOn === false ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: false })}>Kapat</button><button type="button" className={action.isOn === undefined ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: undefined, autoOffEnabled: false })}>Durumu koru</button></div>}
+                      {!entryExitActive && action.passthroughAttributes && !["airPurifier", "dehumidifier"].includes(device?.type || "") && <p className="action-advanced-note">{Object.keys(action.passthroughAttributes).length} gelişmiş cihaz özniteliği değiştirilmeden korunacak.</p>}
                       <div className="device-action-options">
-                      {action.isOn !== false && (device?.brightness !== undefined || action.brightnessEnabled) && <OptionalSetting enabled={action.brightnessEnabled} title="Parlaklık" copy="Seçilmezse mevcut parlaklık korunur." onToggle={() => updateAction(action.deviceId, { brightnessEnabled: !action.brightnessEnabled })}><label className="range-field"><span><b>Parlaklık</b><em>%{action.brightness}</em></span><input type="range" min="1" max="100" value={action.brightness} onChange={(event) => updateAction(action.deviceId, { brightness: Number(event.target.value) })} style={{ "--range-progress": `${action.brightness}%` } as React.CSSProperties} /></label></OptionalSetting>}
-                      {action.isOn !== false && (device?.temperature !== undefined || action.temperatureEnabled) && <OptionalSetting enabled={action.temperatureEnabled} title="Renk sıcaklığı" copy="Seçilmezse mevcut renk sıcaklığı korunur." onToggle={() => updateAction(action.deviceId, { temperatureEnabled: !action.temperatureEnabled })}><label className="range-field temperature"><span><b>Sıcaklık</b><em>{action.temperature}K</em></span><div><Moon size={15} /><input type="range" min="1500" max="6500" step="100" value={action.temperature} onChange={(event) => updateAction(action.deviceId, { temperature: Number(event.target.value) })} style={{ "--range-progress": `${((action.temperature - 1500) / 5000) * 100}%` } as React.CSSProperties} /><Sun size={15} /></div></label></OptionalSetting>}
+                      {(entryExitActive || action.isOn !== false) && (device?.brightness !== undefined || action.brightnessEnabled) && <OptionalSetting enabled={action.brightnessEnabled} title="Parlaklık" copy="Seçilmezse mevcut parlaklık korunur." onToggle={() => updateAction(action.deviceId, { brightnessEnabled: !action.brightnessEnabled })}><label className="range-field"><span><b>Parlaklık</b><em>%{action.brightness}</em></span><input type="range" min="1" max="100" value={action.brightness} onChange={(event) => updateAction(action.deviceId, { brightness: Number(event.target.value) })} style={{ "--range-progress": `${action.brightness}%` } as React.CSSProperties} /></label></OptionalSetting>}
+                      {(entryExitActive || action.isOn !== false) && (device?.temperature !== undefined || action.temperatureEnabled) && <OptionalSetting enabled={action.temperatureEnabled} title="Renk sıcaklığı" copy="Seçilmezse mevcut renk sıcaklığı korunur." onToggle={() => updateAction(action.deviceId, { temperatureEnabled: !action.temperatureEnabled })}><label className="range-field temperature"><span><b>Sıcaklık</b><em>{action.temperature}K</em></span><div><Moon size={15} /><input type="range" min="1500" max="6500" step="100" value={action.temperature} onChange={(event) => updateAction(action.deviceId, { temperature: Number(event.target.value) })} style={{ "--range-progress": `${((action.temperature - 1500) / 5000) * 100}%` } as React.CSSProperties} /><Sun size={15} /></div></label></OptionalSetting>}
                       {(device?.type === "light" || !device) && <OptionalSetting enabled={action.transitionEnabled} title="Yumuşak geçiş" copy="Komutu aniden değil, seçilen sürede uygula." onToggle={() => updateAction(action.deviceId, { transitionEnabled: !action.transitionEnabled })}><label className="field compact-number"><span>Geçiş süresi</span><div><input type="number" min="0" max="600" value={action.transitionSeconds} onChange={(event) => updateAction(action.deviceId, { transitionSeconds: Number(event.target.value) })} /><em>saniye</em></div></label></OptionalSetting>}
-                      {action.isOn && <OptionalSetting enabled={action.autoOffEnabled} title="Otomatik kapat" copy="Cihazı açıldıktan sonra seçilen sürede kapat." onToggle={() => updateAction(action.deviceId, { autoOffEnabled: !action.autoOffEnabled })}><label className="field compact-number"><span>Açık kalma süresi</span><div><input type="number" min="1" max="1440" value={action.autoOffMinutes} onChange={(event) => updateAction(action.deviceId, { autoOffMinutes: Number(event.target.value) })} /><em>dakika</em></div></label></OptionalSetting>}
-                      {device?.type === "airPurifier" && action.isOn !== false && <section className="action-attribute-group"><span><Fan size={16} /><b>Hava temizleyici ayarları</b></span>{Boolean(device.availableModes?.length) && <label className="field"><span>Çalışma modu</span><select value={String(action.passthroughAttributes?.presetMode || "")} onChange={(event) => updateActionAttribute(action.deviceId, "presetMode", event.target.value)}><option value="">Mevcut modu koru</option>{device.availableModes?.map((mode) => <option value={mode} key={mode}>{mode}</option>)}</select></label>}{(device.capabilities?.percentage === true || device.percentage !== undefined) && <label className="range-field"><span><b>Fan seviyesi</b><em>%{Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)}</em></span><input type="range" min="0" max="100" value={Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)} onChange={(event) => updateActionAttribute(action.deviceId, "percentage", Number(event.target.value))} style={{ "--range-progress": `${Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)}%` } as React.CSSProperties} /></label>}</section>}
-                      {device?.type === "dehumidifier" && action.isOn !== false && <section className="action-attribute-group"><span><Droplets size={16} /><b>Nem cihazı ayarları</b></span>{Boolean(device.availableModes?.length) && <label className="field"><span>Çalışma modu</span><select value={String(action.passthroughAttributes?.presetMode || "")} onChange={(event) => updateActionAttribute(action.deviceId, "presetMode", event.target.value)}><option value="">Mevcut modu koru</option>{device.availableModes?.map((mode) => <option value={mode} key={mode}>{mode}</option>)}</select></label>}{(device.capabilities?.targetHumidity === true || device.targetHumidity !== undefined) && <label className="range-field"><span><b>Hedef nem</b><em>%{Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50)}</em></span><input type="range" min="30" max="80" step="5" value={Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50)} onChange={(event) => updateActionAttribute(action.deviceId, "targetHumidity", Number(event.target.value))} style={{ "--range-progress": `${(Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50) - 30) * 2}%` } as React.CSSProperties} /></label>}</section>}
+                      {!entryExitActive && action.isOn && <OptionalSetting enabled={action.autoOffEnabled} title="Otomatik kapat" copy="Cihazı açıldıktan sonra seçilen sürede kapat." onToggle={() => updateAction(action.deviceId, { autoOffEnabled: !action.autoOffEnabled })}><label className="field compact-number"><span>Açık kalma süresi</span><div><input type="number" min="1" max="1440" value={action.autoOffMinutes} onChange={(event) => updateAction(action.deviceId, { autoOffMinutes: Number(event.target.value) })} /><em>dakika</em></div></label></OptionalSetting>}
+                      {!entryExitActive && device?.type === "airPurifier" && action.isOn !== false && <section className="action-attribute-group"><span><Fan size={16} /><b>Hava temizleyici ayarları</b></span>{Boolean(device.availableModes?.length) && <label className="field"><span>Çalışma modu</span><select value={String(action.passthroughAttributes?.presetMode || "")} onChange={(event) => updateActionAttribute(action.deviceId, "presetMode", event.target.value)}><option value="">Mevcut modu koru</option>{device.availableModes?.map((mode) => <option value={mode} key={mode}>{mode}</option>)}</select></label>}{(device.capabilities?.percentage === true || device.percentage !== undefined) && <label className="range-field"><span><b>Fan seviyesi</b><em>%{Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)}</em></span><input type="range" min="0" max="100" value={Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)} onChange={(event) => updateActionAttribute(action.deviceId, "percentage", Number(event.target.value))} style={{ "--range-progress": `${Number(action.passthroughAttributes?.percentage ?? device.percentage ?? 50)}%` } as React.CSSProperties} /></label>}</section>}
+                      {!entryExitActive && device?.type === "dehumidifier" && action.isOn !== false && <section className="action-attribute-group"><span><Droplets size={16} /><b>Nem cihazı ayarları</b></span>{Boolean(device.availableModes?.length) && <label className="field"><span>Çalışma modu</span><select value={String(action.passthroughAttributes?.presetMode || "")} onChange={(event) => updateActionAttribute(action.deviceId, "presetMode", event.target.value)}><option value="">Mevcut modu koru</option>{device.availableModes?.map((mode) => <option value={mode} key={mode}>{mode}</option>)}</select></label>}{(device.capabilities?.targetHumidity === true || device.targetHumidity !== undefined) && <label className="range-field"><span><b>Hedef nem</b><em>%{Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50)}</em></span><input type="range" min="30" max="80" step="5" value={Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50)} onChange={(event) => updateActionAttribute(action.deviceId, "targetHumidity", Number(event.target.value))} style={{ "--range-progress": `${(Number(action.passthroughAttributes?.targetHumidity ?? device.targetHumidity ?? 50) - 30) * 2}%` } as React.CSSProperties} /></label>}</section>}
                       </div>
-                      {action.isOn === false && <p className="action-off-note">Cihaz kapatılır; daha önce kaydedilmiş gelişmiş öznitelikler değiştirilmeden korunur.</p>}
+                      {!entryExitActive && action.isOn === false && <p className="action-off-note">Cihaz kapatılır; daha önce kaydedilmiş gelişmiş öznitelikler değiştirilmeden korunur.</p>}
                     </>}
                   </article>;
                 })}
@@ -2345,8 +2423,8 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
               <div className="builder-section-heading"><span className="soft-icon"><ShieldCheck size={19} /></span><div><h3>Kaydetmeden önce kontrol et</h3><p>Yalnızca seçtiğin tetikleyici, koşul ve seçenekler köprüye gönderilecek.</p></div></div>
               <div className="review-stack">
                 <section><span className="review-number">1</span><div><small>TETİKLEYİCİ</small><b>{triggerSummary}</b></div><button type="button" onClick={() => setStep(2)}>Düzenle</button></section>
-                <section><span className="review-number">2</span><div><small>KOŞULLAR</small><b>{!daysEnabled && !timeWindowEnabled && !cooldownEnabled && !deviceConditionsEnabled ? "Ek koşul yok · her uygun tetiklemede çalışır" : [daysEnabled ? `${days.length} gün` : null, timeWindowEnabled ? `${startTime}–${endTime}` : null, deviceConditionsEnabled ? `${deviceConditions.length} cihaz durumu` : null, cooldownEnabled ? `${cooldownMinutes} dk bekleme` : null].filter(Boolean).join(" · ")}</b></div><button type="button" onClick={() => setStep(3)}>Düzenle</button></section>
-                <section><span className="review-number">3</span><div><small>EYLEMLER</small><b>{blinkEnabled ? `${actions.length} ışık ${blinkDurationSeconds} sn boyunca birlikte yanıp sönecek` : `${actions.length} cihaz yönetilecek`}</b><ul>{actions.map((action) => { const device = devices.find((item) => item.id === action.deviceId); return <li key={action.deviceId}>{device?.name || "Cihaz"}: {blinkEnabled ? `her ${blinkIntervalMilliseconds} ms’de yanıp sön · başlangıç durumuna dön` : actionSettingsSummary(action)}</li>; })}</ul></div><button type="button" onClick={() => setStep(4)}>Düzenle</button></section>
+                <section><span className="review-number">2</span><div><small>KOŞULLAR</small><b>{!daysEnabled && !timeWindowEnabled && (!cooldownEnabled || entryExitActive) && !deviceConditionsEnabled ? "Ek koşul yok · her uygun tetiklemede çalışır" : [daysEnabled ? `${days.length} gün` : null, timeWindowEnabled ? `${startTime}–${endTime}` : null, deviceConditionsEnabled ? `${deviceConditions.length} cihaz durumu` : null, cooldownEnabled && !entryExitActive ? `${cooldownMinutes} dk bekleme` : null].filter(Boolean).join(" · ")}</b></div><button type="button" onClick={() => setStep(3)}>Düzenle</button></section>
+                <section><span className="review-number">3</span><div><small>EYLEMLER</small><b>{entryExitActive ? `${actions.length} ışık girişte açılıp çıkışta kapanacak` : blinkEnabled ? `${actions.length} ışık ${blinkDurationSeconds} sn boyunca birlikte yanıp sönecek` : `${actions.length} cihaz yönetilecek`}</b><ul>{actions.map((action) => { const device = devices.find((item) => item.id === action.deviceId); return <li key={action.deviceId}>{device?.name || "Cihaz"}: {entryExitActive ? `${actionSettingsSummary(action)} · sonraki harekette kapat · ${motionInactivitySummary} güvenli kapanma` : blinkEnabled ? `her ${blinkIntervalMilliseconds} ms’de yanıp sön · başlangıç durumuna dön` : actionSettingsSummary(action)}</li>; })}</ul></div><button type="button" onClick={() => setStep(4)}>Düzenle</button></section>
               </div>
               <div className={`review-status ${allErrors.length ? "has-errors" : "is-ready"}`}>{allErrors.length ? <><Info size={18} /><div><b>Kural henüz kaydedilemiyor</b><p>{allErrors[0]}</p></div></> : <><Check size={18} /><div><b>Kural hazır</b><p>{enabled ? "Kaydettiğinde hemen etkinleşecek." : "Duraklatılmış olarak kaydedilecek."}</p></div></>}</div>
               <pre className="json-preview" aria-label="Kaydedilecek kural seçenekleri">{JSON.stringify(draft, null, 2)}</pre>
@@ -2354,7 +2432,7 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
 
             {currentErrors.length > 0 && step !== 5 && <div className="builder-error" role="alert"><Info size={17} /><div><b>Bu adımı tamamla</b><ul>{currentErrors.map((error) => <li key={error}>{error}</li>)}</ul></div></div>}
           </div>
-          <aside className="rule-preview"><span className="preview-label">CANLI ÖZET</span><span className="preview-icon"><WandSparkles size={24} /></span><h3>{name.trim() || "İsimsiz kural"}</h3><p>{actions.length ? describeRule(draft, devices) : `${triggerSummary}. Henüz bir eylem seçilmedi.`}</p><div className="preview-flow"><span><b>1</b>{triggerType === "motion" ? "Hareket" : triggerType === "button" ? "Buton" : triggerType === "deviceEvent" ? "Bebek ağlaması" : triggerTime}</span><i /><span><b>2</b>{actions.length ? `${actions.length} ${blinkEnabled ? "ışık" : "cihaz"}` : "Eylem yok"}</span></div><button type="button" disabled={allErrors.length > 0 || saving} onClick={() => onTest(draft)}><Play size={16} /> Şimdi test et</button></aside>
+          <aside className="rule-preview"><span className="preview-label">CANLI ÖZET</span><span className="preview-icon"><WandSparkles size={24} /></span><h3>{name.trim() || "İsimsiz kural"}</h3><p>{actions.length ? describeRule(draft, devices) : `${triggerSummary}. Henüz bir eylem seçilmedi.`}</p><div className="preview-flow"><span><b>1</b>{triggerType === "motion" ? entryExitActive ? "Giriş / çıkış" : "Hareket" : triggerType === "button" ? "Buton" : triggerType === "deviceEvent" ? "Bebek ağlaması" : triggerTime}</span><i /><span><b>2</b>{actions.length ? entryExitActive ? "1 ışık · aç / kapat" : `${actions.length} ${blinkEnabled ? "ışık" : "cihaz"}` : "Eylem yok"}</span></div><button type="button" disabled={allErrors.length > 0 || saving} onClick={() => onTest(draft)}><Play size={16} /> Şimdi test et</button></aside>
         </div>
         <footer><button type="button" className="secondary-button" disabled={saving} onClick={step === 1 ? onClose : () => setStep((current) => current - 1)}>{step === 1 ? "Vazgeç" : <><ArrowLeft size={16} /> Geri</>}</button>{step < 5 ? <button type="button" className="primary-button" disabled={currentErrors.length > 0 || saving} onClick={() => setStep((current) => current + 1)}>Devam <ArrowRight size={16} /></button> : <button type="button" className="primary-button" onClick={submitRule} disabled={allErrors.length > 0 || saving}><Save size={16} /> {saving ? "Kaydediliyor…" : initialRule ? "Değişiklikleri kaydet" : "Kuralı kaydet"}</button>}</footer>
       </div>

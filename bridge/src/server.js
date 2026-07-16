@@ -527,7 +527,7 @@ export async function createBridgeService(options = {}) {
       const body = await readJsonBody(request);
       const attributes = validateAttributes(body.attributes);
       const transitionTime = validateTransitionTime(body.transitionTime);
-      ruleEngine.supersedeDevice(id);
+      await ruleEngine.supersedeDevice(id);
       await setDeviceAttributes({ id, attributes, transitionTime });
       sendJson(response, 200, { ok: true, id }, commonHeaders);
       return;
@@ -550,7 +550,7 @@ export async function createBridgeService(options = {}) {
         throw new ApiError(400, "INVALID_STATE", "isOn must be a boolean.");
       }
 
-      ruleEngine.supersedeAllDevices();
+      await ruleEngine.supersedeAllDevices();
       if (body.attributes !== undefined || transitionTime !== undefined) {
         const attributes =
           body.attributes === undefined
@@ -577,7 +577,7 @@ export async function createBridgeService(options = {}) {
     if (sceneMatch) {
       if (request.method !== "POST") throw methodNotAllowed(["POST"]);
       const id = routeId(sceneMatch[1], "scene");
-      ruleEngine.supersedeAllDevices();
+      await ruleEngine.supersedeAllDevices();
       await hubManager.run((client) => client.scenes.trigger({ id }));
       sendJson(response, 200, { ok: true, id }, commonHeaders);
       return;

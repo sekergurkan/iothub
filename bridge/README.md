@@ -119,6 +119,33 @@ Desteklenen tetikleyiciler:
 - `state`: bir cihaz özniteliği seçilen eşiği ilk kez geçtiğinde çalışır. Yeni ve önceki değer birlikte değerlendirilir; koşul doğru kaldığı sürece tekrar tetiklenmez.
 - `deviceEvent`: Home Assistant'ın güvenli biçimde kanonikleştirdiği kamera olaylarını `deviceId` ve `eventType` ile kesin eşler.
 
+Tek bir geçiş sensörüyle “girişte aç / çıkışta kapat” davranışı için aynı kurala `motionControl` eklenir. İlk ayrı hareket ışığı açar; sensör arada sakin duruma geçtikten sonra `minimumOnSeconds` dolmuşsa sonraki hareket ışığı kapatır. İkinci hareket kaçırılırsa `inactivitySeconds` sonrasında emniyet kapatması uygulanır. Bu mod tam olarak bir `isOn: true` hedefi kabul eder ve `effect`, `cooldownSeconds` veya `offAfterSeconds` ile birleştirilemez.
+
+```json
+{
+  "name": "Çalışma odası giriş / çıkış",
+  "trigger": {
+    "type": "occupancy",
+    "deviceId": "MOTION_DEVICE_ID",
+    "isDetected": true
+  },
+  "actions": [
+    {
+      "deviceId": "OFFICE_LIGHT_ID",
+      "isOn": true,
+      "brightness": 85,
+      "temperature": 4000,
+      "transitionTime": 2000
+    }
+  ],
+  "motionControl": {
+    "mode": "entryExit",
+    "minimumOnSeconds": 10,
+    "inactivitySeconds": 300
+  }
+}
+```
+
 `conditions.days`, `conditions.startTime` ve `conditions.endTime` tüm tetikleyicilerde kullanılabilir. Bitiş saati başlangıçtan küçükse aralık gece yarısını geçer. Hiçbir koşul seçilmediyse bu alanlar JSON'a eklenmez; `days` veya `deviceStates` etkinleştirilmiş fakat boş bırakılmışsa kural reddedilir.
 
 `conditions.deviceStates` içindeki bütün satırlar birlikte doğru olmalıdır. Desteklenen durumlar ve operatörler:
@@ -191,7 +218,7 @@ Servis varsayılan olarak yalnızca `127.0.0.1` üzerinde dinler. Private Networ
 
 ## Çalışma sürekliliği
 
-Kural tanımları ile çalışma sayaçları diskte kalıcıdır. Bekleyen “bir süre sonra kapat” sayaçları ise işlem belleğindedir; köprü servisi yeniden başlatılırsa o anda bekleyen sayaç iptal olur. Süreli hareket kurallarında ışık, bir sonraki geçerli sensör olayıyla yeniden normal akışına girer. Bu nedenle köprüyü sürekli açık bir cihazda servis olarak çalıştırın ve servis yeniden başlatmalarını mümkün olduğunca ışıklar kapalıyken yapın.
+Kural tanımları ile çalışma sayaçları diskte kalıcıdır. Genel `offAfterSeconds` sayaçları işlem belleğindedir ve köprü yeniden başlatılırsa iptal olur. `motionControl` giriş/çıkış oturumu ve hareketsizlik son tarihi ise diskte tutulur; köprü yeniden başladığında kalan süre yeniden kurulur. Oturum sensör hareketliyken kaydedilmişse sensörün güncel durumu yeniden okunur ve köprü kapalıyken kaçırılan “hareket bitti” olayı için emniyet sayacı tekrar başlatılır. Tarihi geçmiş emniyet kapatması bağlantı hazır olur olmaz güvenli biçimde tekrar denenir.
 
 ## Ayarlar
 

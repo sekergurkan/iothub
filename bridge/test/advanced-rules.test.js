@@ -34,6 +34,610 @@ function blinkRule(overrides = {}) {
   };
 }
 
+function entryExitMotionRule(overrides = {}) {
+  return {
+    id: "office-entry-exit",
+    name: "Office entry and exit",
+    trigger: { type: "occupancy", deviceId: "motion-1", isDetected: true },
+    actions: [
+      {
+        deviceId: "light-1",
+        isOn: true,
+        brightness: 85,
+        temperature: 4_000,
+        transitionTime: 2_000,
+      },
+    ],
+    motionControl: {
+      mode: "entryExit",
+      minimumOnSeconds: 10,
+      inactivitySeconds: 1,
+    },
+    ...overrides,
+  };
+}
+
+function motionEvent(id, isDetected, clock, oldIsDetected = !isDetected) {
+  return {
+    id,
+    type: "deviceStateChanged",
+    time: new Date(clock).toISOString(),
+    data: {
+      id: "motion-1",
+      attributes: { isDetected },
+      oldAttributes: { isDetected: oldIsDetected },
+    },
+  };
+}
+
+function motionTestDevices(calls) {
+  const light = {
+    id: "light-1",
+    type: "light",
+    isReachable: true,
+    attributes: { isOn: false, lightLevel: 85, colorTemperature: 4_000 },
+  };
+  return {
+    light,
+    getDevice: async (id) => {
+      assert.equal(id, light.id);
+      return structuredClone(light);
+    },
+    setDeviceAttributes: async (request) => {
+      calls.push(structuredClone(request));
+      if (typeof request.attributes.isOn === "boolean") {
+        light.attributes.isOn = request.attributes.isOn;
+      }
+      if (typeof request.attributes.lightLevel === "number") {
+        light.attributes.lightLevel = request.attributes.lightLevel;
+      }
+      if (typeof request.attributes.colorTemperature === "number") {
+        light.attributes.colorTemperature = request.attributes.colorTemperature;
+      }
+    },
+  };
+}
+
+test("entry-exit motion control normalizes, persists, reloads, and rejects unsafe combinations", async () => {
+  const saves = [];
+  const { engine } = createEngine({
+    saveRules: async (rules) => saves.push(structuredClone(rules)),
+  });
+  const created = await engine.create(entryExitMotionRule());
+
+  assert.deepEqual(created.motionControl, {
+    mode: "entryExit",
+    minimumOnSeconds: 10,
+    inactivitySeconds: 1,
+  });
+  assert.deepEqual(saves.at(-1)[0].motionControl, created.motionControl);
+
+  const reloaded = new RuleEngine({
+    rules: saves.at(-1),
+    saveRules: async () => {},
+    setDeviceAttributes: async () => {},
+  });
+  assert.deepEqual(reloaded.get(created.id).motionControl, created.motionControl);
+
+  const rejectsInvalidRule = (error) => error?.code === "INVALID_RULE";
+  await assert.rejects(
+    engine.create(
+      entryExitMotionRule({
+        id: "entry-exit-wrong-trigger",
+        trigger: { type: "button", deviceId: "button-1", clickPattern: "singlePress" },
+      }),
+    ),
+    rejectsInvalidRule,
+  );
+  await assert.rejects(
+    engine.create(
+      entryExitMotionRule({
+        id: "entry-exit-cleared-only",
+        trigger: { type: "motion", deviceId: "motion-1", isDetected: false },
+      }),
+    ),
+    rejectsInvalidRule,
+  );
+  await assert.rejects(
+    engine.create(
+      entryExitMotionRule({
+        id: "entry-exit-multiple-lights",
+        actions: [
+          { deviceId: "light-1", isOn: true },
+          { deviceId: "light-2", isOn: true },
+        ],
+      }),
+    ),
+    rejectsInvalidRule,
+  );
+  await assert.rejects(
+    engine.create(entryExitMotionRule({ id: "entry-exit-auto-off", offAfterSeconds: 60 })),
+    rejectsInvalidRule,
+  );
+  await assert.rejects(
+    engine.create(entryExitMotionRule({ id: "entry-exit-cooldown", cooldownSeconds: 10 })),
+    rejectsInvalidRule,
+  );
+  await assert.rejects(
+    engine.create(
+      entryExitMotionRule({
+        id: "entry-exit-action-auto-off",
+        actions: [{ deviceId: "light-1", isOn: true, offAfterSeconds: 60 }],
+      }),
+    ),
+    rejectsInvalidRule,
+  );
+  await assert.rejects(
+    engine.create(
+      entryExitMotionRule({
+        id: "entry-exit-short-guard",
+        motionControl: {
+          mode: "entryExit",
+          minimumOnSeconds: 9,
+          inactivitySeconds: 300,
+        },
+      }),
+    ),
+    rejectsInvalidRule,
+  );
+
+  assert.equal(saves.at(-1).length, 1, "invalid motion-control rules are never persisted");
+  reloaded.stop();
+  engine.stop();
+});
+
+test("entry-exit motion control opens once, ignores duplicate detection, and closes only on an eligible return", async () => {
+  let clock = 0;
+  const calls = [];
+  const devices = motionTestDevices(calls);
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+    now: () => clock,
+  });
+  await engine.create(entryExitMotionRule());
+
+  await engine.handleEvent(motionEvent("entry", true, clock, false));
+  assert.deepEqual(calls.map((call) => call.attributes), [
+    { isOn: true },
+    { lightLevel: 85 },
+    { colorTemperature: 4_000 },
+  ]);
+
+  clock = 2_000;
+  await engine.handleEvent(motionEvent("duplicate-detected", true, clock, true));
+  assert.equal(calls.length, 3, "a repeated true state without a clear edge is ignored");
+
+  clock = 3_000;
+  await engine.handleEvent(motionEvent("first-clear", false, clock, true));
+  clock = 5_000;
+  await engine.handleEvent(motionEvent("early-return", true, clock, false));
+  assert.equal(calls.length, 3, "a return inside the ten-second guard keeps the light on");
+  assert.equal(devices.light.attributes.isOn, true);
+
+  clock = 6_000;
+  await engine.handleEvent(motionEvent("second-clear", false, clock, true));
+  clock = 11_000;
+  await engine.handleEvent(motionEvent("exit", true, clock, false));
+  assert.deepEqual(calls.at(-1).attributes, { isOn: false });
+  assert.equal(calls.length, 4, "the first eligible clear-to-detected edge closes once");
+  assert.equal(devices.light.attributes.isOn, false);
+  engine.stop();
+});
+
+test("entry-exit motion control turns the light off after its inactivity fallback", async () => {
+  const calls = [];
+  const devices = motionTestDevices(calls);
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await engine.create(entryExitMotionRule());
+
+  await engine.handleEvent(motionEvent("fallback-entry", true, Date.now(), false));
+  await engine.handleEvent(motionEvent("fallback-clear", false, Date.now(), true));
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+
+  assert.deepEqual(calls.at(-1).attributes, { isOn: false });
+  assert.equal(devices.light.attributes.isOn, false);
+  engine.stop();
+});
+
+test("manual supersede cancels an entry-exit inactivity fallback", async () => {
+  const calls = [];
+  const devices = motionTestDevices(calls);
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await engine.create(entryExitMotionRule());
+
+  await engine.handleEvent(motionEvent("supersede-entry", true, Date.now(), false));
+  await engine.handleEvent(motionEvent("supersede-clear", false, Date.now(), true));
+  await engine.supersedeDevice("light-1");
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+
+  assert.equal(devices.light.attributes.isOn, true);
+  assert.equal(
+    calls.filter((call) => call.attributes.isOn === false).length,
+    0,
+    "the stale fallback never writes after a manual action takes ownership",
+  );
+  engine.stop();
+});
+
+test("entry-exit inactivity ownership survives a bridge restart and stays private", async () => {
+  const calls = [];
+  const saves = [];
+  const devices = motionTestDevices(calls);
+  const firstEngine = new RuleEngine({
+    rules: [],
+    saveRules: async (rules) => saves.push(structuredClone(rules)),
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  const created = await firstEngine.create(entryExitMotionRule());
+  await firstEngine.handleEvent(motionEvent("restart-entry", true, Date.now(), false));
+  await firstEngine.handleEvent(motionEvent("restart-clear", false, Date.now(), true));
+
+  const storedRules = structuredClone(saves.at(-1));
+  assert.equal(storedRules[0]._motionRuntime.phase, "clearWaiting");
+  assert.equal(firstEngine.get(created.id)._motionRuntime, undefined);
+  assert.equal(firstEngine.list()[0]._motionRuntime, undefined);
+  firstEngine.stop();
+
+  calls.length = 0;
+  const restartedEngine = new RuleEngine({
+    rules: storedRules,
+    saveRules: async () => {},
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  restartedEngine.start();
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+
+  assert.deepEqual(calls.at(-1).attributes, { isOn: false });
+  assert.equal(devices.light.attributes.isOn, false);
+  assert.equal(restartedEngine.get(created.id)._motionRuntime, undefined);
+  restartedEngine.stop();
+});
+
+test("restart reconciles a missed clear event and restores the inactivity fallback", async () => {
+  const calls = [];
+  const saves = [];
+  const devices = motionTestDevices(calls);
+  const firstEngine = new RuleEngine({
+    rules: [],
+    saveRules: async (rules) => saves.push(structuredClone(rules)),
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await firstEngine.create(entryExitMotionRule());
+  await firstEngine.handleEvent(
+    motionEvent("restart-detected-entry", true, Date.now(), false),
+  );
+  const storedRules = structuredClone(saves.at(-1));
+  assert.equal(storedRules[0]._motionRuntime.phase, "detected");
+  firstEngine.stop();
+
+  calls.length = 0;
+  const restartedEngine = new RuleEngine({
+    rules: storedRules,
+    saveRules: async () => {},
+    getDevice: async (id) => {
+      if (id === "motion-1") {
+        return {
+          id,
+          type: "motion",
+          isReachable: true,
+          attributes: { isDetected: false },
+        };
+      }
+      return devices.getDevice(id);
+    },
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  restartedEngine.start();
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+
+  assert.deepEqual(calls.at(-1).attributes, { isOn: false });
+  assert.equal(devices.light.attributes.isOn, false);
+  restartedEngine.stop();
+});
+
+test("a regular rule taking ownership cancels the old entry-exit fallback", async () => {
+  const calls = [];
+  const devices = motionTestDevices(calls);
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await engine.create(entryExitMotionRule());
+  await engine.create({
+    id: "manual-scene-rule",
+    name: "Manual scene",
+    trigger: {
+      type: "button",
+      deviceId: "button-1",
+      clickPattern: "singlePress",
+    },
+    actions: [{ deviceId: "light-1", isOn: true, brightness: 30 }],
+  });
+
+  await engine.handleEvent(motionEvent("rule-owner-entry", true, Date.now(), false));
+  await engine.handleEvent(motionEvent("rule-owner-clear", false, Date.now(), true));
+  await engine.handleEvent({
+    id: "manual-scene-press",
+    type: "remotePressEvent",
+    time: new Date().toISOString(),
+    data: { id: "button-1", clickPattern: "singlePress" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+
+  assert.equal(devices.light.attributes.isOn, true);
+  assert.equal(
+    calls.filter((call) => call.attributes.isOn === false).length,
+    0,
+  );
+  engine.stop();
+});
+
+test("an active motion session still consumes clear events after entry conditions change", async () => {
+  const calls = [];
+  const devices = motionTestDevices(calls);
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await engine.create(
+    entryExitMotionRule({
+      conditions: {
+        deviceStates: [
+          {
+            deviceId: "light-1",
+            attribute: "isOn",
+            operator: "equals",
+            value: false,
+          },
+        ],
+      },
+    }),
+  );
+
+  await engine.handleEvent(motionEvent("condition-entry", true, Date.now(), false));
+  assert.equal(devices.light.attributes.isOn, true);
+  await engine.handleEvent(motionEvent("condition-clear", false, Date.now(), true));
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+
+  assert.deepEqual(calls.at(-1).attributes, { isOn: false });
+  assert.equal(devices.light.attributes.isOn, false);
+  engine.stop();
+});
+
+test("motion does not overwrite a light that is already under manual control", async () => {
+  const calls = [];
+  const saves = [];
+  const devices = motionTestDevices(calls);
+  devices.light.attributes.isOn = true;
+  devices.light.attributes.lightLevel = 30;
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async (rules) => saves.push(structuredClone(rules)),
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await engine.create(entryExitMotionRule());
+
+  await engine.handleEvent(motionEvent("manual-light-motion", true, Date.now(), false));
+
+  assert.equal(calls.length, 0, "the 30% manual scene is not replaced by the 85% entry scene");
+  assert.equal(devices.light.attributes.lightLevel, 30);
+  assert.equal(saves.at(-1)[0]._motionRuntime, undefined);
+  engine.stop();
+});
+
+test("manual ownership during motion runtime persistence cannot leave a stale fallback", async () => {
+  const calls = [];
+  const saves = [];
+  const devices = motionTestDevices(calls);
+  let blockRuntimeSave = false;
+  let releaseRuntimeSave;
+  let runtimeSaveStarted;
+  const runtimeSaveReady = new Promise((resolve) => {
+    runtimeSaveStarted = resolve;
+  });
+  const runtimeSaveGate = new Promise((resolve) => {
+    releaseRuntimeSave = resolve;
+  });
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async (rules) => {
+      saves.push(structuredClone(rules));
+      if (blockRuntimeSave && rules[0]?._motionRuntime) {
+        blockRuntimeSave = false;
+        runtimeSaveStarted();
+        await runtimeSaveGate;
+      }
+    },
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await engine.create(entryExitMotionRule());
+  blockRuntimeSave = true;
+
+  const opening = engine.handleEvent(
+    motionEvent("persist-race-entry", true, Date.now(), false),
+  );
+  await runtimeSaveReady;
+  await engine.supersedeDevice("light-1");
+  releaseRuntimeSave();
+  await opening;
+
+  assert.equal(saves.at(-1)[0]._motionRuntime, undefined);
+  assert.equal(
+    calls.filter((call) => call.attributes.isOn === false).length,
+    0,
+  );
+  engine.stop();
+});
+
+test("disabling a motion rule cancels its timer before persistence completes", async () => {
+  const calls = [];
+  const devices = motionTestDevices(calls);
+  let blockDisableSave = false;
+  let disableSaveStarted;
+  let releaseDisableSave;
+  const disableSaveReady = new Promise((resolve) => {
+    disableSaveStarted = resolve;
+  });
+  const disableSaveGate = new Promise((resolve) => {
+    releaseDisableSave = resolve;
+  });
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async (rules) => {
+      if (blockDisableSave && rules[0]?.enabled === false) {
+        blockDisableSave = false;
+        disableSaveStarted();
+        await disableSaveGate;
+      }
+    },
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await engine.create(entryExitMotionRule());
+  await engine.handleEvent(motionEvent("disable-entry", true, Date.now(), false));
+  await engine.handleEvent(motionEvent("disable-clear", false, Date.now(), true));
+  blockDisableSave = true;
+
+  const disabling = engine.update("office-entry-exit", { enabled: false });
+  await disableSaveReady;
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  assert.equal(
+    calls.filter((call) => call.attributes.isOn === false).length,
+    0,
+  );
+  releaseDisableSave();
+  await disabling;
+  engine.stop();
+});
+
+test("manual ownership wins while an expired fallback is being claimed", async () => {
+  const calls = [];
+  const devices = motionTestDevices(calls);
+  let blockClaimSave = false;
+  let claimSaveStarted;
+  let releaseClaimSave;
+  const claimSaveReady = new Promise((resolve) => {
+    claimSaveStarted = resolve;
+  });
+  const claimSaveGate = new Promise((resolve) => {
+    releaseClaimSave = resolve;
+  });
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async (rules) => {
+      if (
+        blockClaimSave &&
+        rules[0]?._motionRuntime?.phase === "clearWaiting" &&
+        rules[0]._motionRuntime.revision === 3
+      ) {
+        blockClaimSave = false;
+        claimSaveStarted();
+        await claimSaveGate;
+      }
+    },
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+  });
+  await engine.create(entryExitMotionRule());
+  await engine.handleEvent(motionEvent("claim-entry", true, Date.now(), false));
+  await engine.handleEvent(motionEvent("claim-clear", false, Date.now(), true));
+  blockClaimSave = true;
+
+  let claimWaitTimeout;
+  try {
+    await Promise.race([
+      claimSaveReady,
+      new Promise((_, reject) => {
+        claimWaitTimeout = setTimeout(
+          () => reject(new Error("motion timeout claim did not start")),
+          1_500,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(claimWaitTimeout);
+  }
+  const manualOwnership = engine.supersedeDevice("light-1");
+  releaseClaimSave();
+  await manualOwnership;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(
+    calls.filter((call) => call.attributes.isOn === false).length,
+    0,
+    "the stale timeout never sends an off command after manual ownership",
+  );
+  engine.stop();
+});
+
+test("a baby-cry blink completes and restores before an expired motion fallback closes", async () => {
+  const calls = [];
+  const executions = [];
+  const devices = motionTestDevices(calls);
+  const engine = new RuleEngine({
+    rules: [],
+    saveRules: async () => {},
+    getDevice: devices.getDevice,
+    setDeviceAttributes: devices.setDeviceAttributes,
+    onExecution: (execution) => executions.push(execution),
+  });
+  await engine.create(entryExitMotionRule());
+  await engine.create(
+    blinkRule({
+      id: "baby-cry-office-blink",
+      actions: [{ deviceId: "light-1", isOn: true }],
+    }),
+  );
+  await engine.handleEvent(motionEvent("blink-entry", true, Date.now(), false));
+  await engine.handleEvent(motionEvent("blink-clear", false, Date.now(), true));
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  await engine.handleEvent({
+    id: "baby-cry-during-fallback",
+    type: "deviceEvent",
+    time: new Date().toISOString(),
+    data: { id: "camera-1", eventType: "babyCry" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const blinkPowerWrites = calls.filter(
+    (call) =>
+      call.transitionTime === 0 &&
+      Object.keys(call.attributes).length === 1 &&
+      typeof call.attributes.isOn === "boolean",
+  );
+  assert.equal(blinkPowerWrites.length, 11, "all ten phases and the restore write complete");
+  assert.equal(
+    executions.find((execution) => execution.ruleId === "baby-cry-office-blink")?.status,
+    "success",
+  );
+  assert.deepEqual(calls.at(-1).attributes, { isOn: false });
+  assert.equal(devices.light.attributes.isOn, false);
+  engine.stop();
+});
+
 test("blink effects normalize, persist, reload, and reject unsafe combinations", async () => {
   const saves = [];
   const { engine } = createEngine({
