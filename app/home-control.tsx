@@ -244,6 +244,9 @@ async function requestBridge(settings: BridgeSettings, path: string, init?: Requ
   });
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: "bridge_error" }));
+    if (response.status === 401 && error.error?.code === "UNAUTHORIZED") {
+      throw new Error("Köprü bağlantı anahtarı bu tarayıcı oturumunda bulunamadı veya geçersiz.");
+    }
     throw new Error(error.message || error.error?.message || (typeof error.error === "string" ? error.error : "Köprüye bağlanılamadı"));
   }
   if (response.status === 204) return null;
@@ -1448,14 +1451,25 @@ export function HomeControl() {
       {homeAssistantModalOpen && (
         <HomeAssistantModal
           status={homeAssistantStatus}
+          bridgeKeyMissing={!bridgeSettings.key}
           onClose={() => setHomeAssistantModalOpen(false)}
-          onConnect={async (baseUrl, accessToken) => {
-            const payload = await bridgeFetch("/api/integrations/home-assistant/configure", {
+          onConnect={async (baseUrl, accessToken, suppliedBridgeKey) => {
+            let settings = bridgeSettings;
+            if (!settings.key) {
+              if (!suppliedBridgeKey) throw new Error("Önce Yuva köprü bağlantı anahtarını girin.");
+              settings = { ...settings, key: suppliedBridgeKey };
+              await requestBridge(settings, "/api/status");
+              setBridgeSettings(settings);
+              window.localStorage.setItem("yuva-bridge-url", settings.url);
+              window.sessionStorage.setItem("yuva-bridge-key", settings.key);
+              window.localStorage.setItem("yuva-connection-mode", "bridge");
+            }
+            const payload = await requestBridge(settings, "/api/integrations/home-assistant/configure", {
               method: "POST",
               body: JSON.stringify({ baseUrl, accessToken }),
             });
             setHomeAssistantStatus(normalizeHomeAssistantStatus(payload));
-            await syncBridge();
+            await syncBridge(settings);
             setHomeAssistantModalOpen(false);
             showToast("Xiaomi cihazları Home Assistant üzerinden bağlandı");
           }}
@@ -2257,9 +2271,10 @@ function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { device
   );
 }
 
-function HomeAssistantModal({ status, onClose, onConnect }: { status: HomeAssistantStatus; onClose: () => void; onConnect: (baseUrl: string, accessToken: string) => Promise<void> }) {
+function HomeAssistantModal({ status, bridgeKeyMissing, onClose, onConnect }: { status: HomeAssistantStatus; bridgeKeyMissing: boolean; onClose: () => void; onConnect: (baseUrl: string, accessToken: string, bridgeKey?: string) => Promise<void> }) {
   const [baseUrl, setBaseUrl] = useState(status.baseUrl || "http://127.0.0.1:8124");
   const [accessToken, setAccessToken] = useState("");
+  const [bridgeKey, setBridgeKey] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -2268,8 +2283,9 @@ function HomeAssistantModal({ status, onClose, onConnect }: { status: HomeAssist
     setLoading(true);
     setError(null);
     try {
-      await onConnect(baseUrl.trim(), accessToken.trim());
+      await onConnect(baseUrl.trim(), accessToken.trim(), bridgeKey.trim() || undefined);
       setAccessToken("");
+      setBridgeKey("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Home Assistant bağlantısı kurulamadı");
     } finally {
@@ -2283,12 +2299,13 @@ function HomeAssistantModal({ status, onClose, onConnect }: { status: HomeAssist
       <form className="connection-modal ha-modal" onSubmit={submit} autoComplete="off">
         <header><span className="connection-hero-icon xiaomi"><Fan size={25} /></span><button type="button" aria-label="Kapat" onClick={onClose}><X size={20} /></button></header>
         <span className="eyebrow">XIAOMI · YEREL ENTEGRASYON</span><h2 id="home-assistant-title">Xiaomi cihazlarını ekle.</h2><p>Home Assistant, Xiaomi Home hesabındaki desteklenen cihazları Yuva köprüsüne güvenli biçimde aktarır.</p>
+        {bridgeKeyMissing && <><div className="integration-error"><WifiOff size={15} /><span>Bu tarayıcı oturumunda Yuva köprü anahtarı bulunamadı. Aşağıdaki alanı bir kez doldurduğunuzda iki bağlantı birlikte tamamlanacak.</span></div><label className="field"><span>Yuva köprü bağlantı anahtarı</span><div className="input-with-icon"><ShieldCheck size={17} /><input type="password" value={bridgeKey} onChange={(event) => setBridgeKey(event.target.value)} placeholder="bridge/.data/config.json içindeki bridgeKey" autoComplete="new-password" /></div><small>DIRIGERA tokenı değil; Yuva köprüsünün ürettiği yerel anahtar.</small></label></>}
         <label className="field"><span>Home Assistant adresi</span><div className="input-with-icon"><House size={17} /><input inputMode="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="http://127.0.0.1:8124" /></div><small>Bu bilgisayardaki kurulum için varsayılan adresi değiştirmene gerek yok.</small></label>
         <label className="field"><span>Uzun ömürlü erişim tokenı</span><div className="input-with-icon"><ShieldCheck size={17} /><input type="password" name="home-assistant-token" value={accessToken} onChange={(event) => setAccessToken(event.target.value)} placeholder="Home Assistant profilinden oluşturduğun token" autoComplete="new-password" /></div><small>Home Assistant profilinin en altındaki “Long-lived access tokens” bölümünden oluştur. Token tarayıcıda saklanmaz.</small></label>
         {error && <div className="form-error"><WifiOff size={17} />{error}</div>}
         <div className="integration-scope"><span><Fan size={16} /> Hava temizleyici</span><span><Droplets size={16} /> Nem cihazı</span><span><Lightbulb size={16} /> Ampul</span><span><Camera size={16} /> Kamera durumu</span></div>
         <div className="camera-limit-note"><Camera size={16} /><p><b>Kamera için canlı yayın vaat edilmez.</b> C701 yalnızca Home Assistant’ın sunduğu durum, olay ve gizlilik kontrolleriyle gösterilir.</p></div>
-        <button className="primary-button wide" type="submit" disabled={loading || !baseUrl.trim() || !accessToken.trim()}>{loading ? <><RefreshCw size={17} className="spin" /> Bağlantı doğrulanıyor…</> : <><House size={17} /> Home Assistant’a bağlan</>}</button>
+        <button className="primary-button wide" type="submit" disabled={loading || !baseUrl.trim() || !accessToken.trim() || (bridgeKeyMissing && !bridgeKey.trim())}>{loading ? <><RefreshCw size={17} className="spin" /> Bağlantı doğrulanıyor…</> : <><House size={17} /> Home Assistant’a bağlan</>}</button>
       </form>
     </div>
   );

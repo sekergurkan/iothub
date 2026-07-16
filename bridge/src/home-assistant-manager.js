@@ -174,13 +174,13 @@ function chooseDeviceType(device, entities) {
   const domains = new Set(entities.map((entity) => domainOf(entity.entityId)));
 
   if (/camera|kamera|c701|mjsxj|chuangmi\.camera/.test(allText)) return "camera";
-  if (domains.has("light")) return "light";
   if (domains.has("humidifier") || /dehumid|nem alma|derh|csj0/.test(allText)) {
     return "dehumidifier";
   }
   if (domains.has("fan") && /purifier|airp|hava temiz|zhimi/.test(allText)) {
     return "airPurifier";
   }
+  if (domains.has("light")) return "light";
   return null;
 }
 
@@ -188,7 +188,8 @@ function eventTypeFor(entity) {
   const text = entityText(entity);
   if (/baby.*cry|cry.*baby|bebek.*ağla/.test(text)) return "babyCry";
   if (/pet|animal|evcil/.test(text)) return "petDetected";
-  if (/person|human|kişi|insan/.test(text)) return "personDetected";
+  if (/no[-_ ]*human|long[-_ ]*time[-_ ]*no[-_ ]*human/.test(text)) return null;
+  if (/someone.*appear|person|human|kişi|insan/.test(text)) return "personDetected";
   if (/abnormal.*sound|sound.*abnormal|anormal.*ses/.test(text)) return "abnormalSound";
   if (/geo.?fence|geofence/.test(text)) return "geofence";
   if (/motion|hareket/.test(text)) return "motionDetected";
@@ -817,7 +818,7 @@ export class HomeAssistantManager {
     const operations = [];
     const transition =
       Number.isInteger(transitionTime) && transitionTime > 0 ? transitionTime / 1_000 : undefined;
-    const light = this.#entityFor(group, "light");
+    const light = group.type === "light" ? this.#entityFor(group, "light") : null;
     const fan = this.#entityFor(group, "fan");
     const humidifier = this.#entityFor(group, "humidifier");
     const privacy = this.#entityFor(group, "switch", /privacy|gizlilik|sleep/);
@@ -828,14 +829,23 @@ export class HomeAssistantManager {
         /camera|kamera/.test(text) &&
         !/privacy|gizlilik|sleep/.test(text),
     );
+    const powerEntity =
+      group.type === "light"
+        ? light
+        : group.type === "airPurifier"
+          ? fan
+          : group.type === "dehumidifier"
+            ? humidifier
+            : group.type === "camera"
+              ? cameraSwitch
+              : null;
 
     const isOn = requested.isOn;
     delete requested.isOn;
     if (isOn === true) {
-      const entity = light || fan || humidifier || cameraSwitch;
-      if (!entity) throw apiError("HOME_ASSISTANT_ATTRIBUTE_UNSUPPORTED", "This device does not expose a power control.", 409);
+      if (!powerEntity) throw apiError("HOME_ASSISTANT_ATTRIBUTE_UNSUPPORTED", "This device does not expose a power control.", 409);
       operations.push(() =>
-        this.#callService(domainOf(entity.entityId), "turn_on", compact({ entity_id: entity.entityId, transition })),
+        this.#callService(domainOf(powerEntity.entityId), "turn_on", compact({ entity_id: powerEntity.entityId, transition })),
       );
     }
     const lightLevel = requested.lightLevel ?? requested.brightness;
@@ -902,10 +912,9 @@ export class HomeAssistantManager {
       operations.push(() => this.#callService("switch", privacyValue ? "turn_on" : "turn_off", { entity_id: privacy.entityId }));
     }
     if (isOn === false) {
-      const entity = light || fan || humidifier || cameraSwitch;
-      if (!entity) throw apiError("HOME_ASSISTANT_ATTRIBUTE_UNSUPPORTED", "This device does not expose a power control.", 409);
+      if (!powerEntity) throw apiError("HOME_ASSISTANT_ATTRIBUTE_UNSUPPORTED", "This device does not expose a power control.", 409);
       operations.push(() =>
-        this.#callService(domainOf(entity.entityId), "turn_off", compact({ entity_id: entity.entityId, transition })),
+        this.#callService(domainOf(powerEntity.entityId), "turn_off", compact({ entity_id: powerEntity.entityId, transition })),
       );
     }
     if (Object.keys(requested).length || operations.length === 0) {
