@@ -33,7 +33,7 @@ curl -X POST http://127.0.0.1:8787/api/pair \
   -d '{"gatewayIP":"192.168.1.50"}'
 ```
 
-`gatewayIP` isteğe bağlıdır; verilmezse mDNS ile keşif denenir. Güvenlik amacıyla elle verilen adres RFC1918, link-local, loopback veya carrier-grade NAT aralığında bir IPv4/IPv6 adresi olmalıdır. Access token hiçbir API cevabında dönmez ve loglanmaz.
+`gatewayIP` isteğe bağlıdır; verilmezse mDNS ile keşif denenir ve bulunan adres sonraki açılışlar için kaydedilir. IPv4 adresi özel/yerel bir aralıkta olmalıdır. IPv6 kullanan ev ağlarında DIRIGERA global-unicast bir yerel arayüz adresi ilan edebildiğinden unicast IPv6 adresleri de kabul edilir; multicast ve belirsiz adresler reddedilir. Access token hiçbir API cevabında dönmez ve loglanmaz.
 
 Bağlantı durumu:
 

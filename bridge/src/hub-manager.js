@@ -31,24 +31,16 @@ function isPrivateIPv4(ip) {
   );
 }
 
-function isPrivateIPv6(ip) {
+function isAllowedUnicastIPv6(ip) {
   const normalized = ip.toLowerCase();
-  return (
-    normalized === "::1" ||
-    normalized.startsWith("fc") ||
-    normalized.startsWith("fd") ||
-    normalized.startsWith("fe8") ||
-    normalized.startsWith("fe9") ||
-    normalized.startsWith("fea") ||
-    normalized.startsWith("feb")
-  );
+  return normalized !== "::" && !normalized.startsWith("ff");
 }
 
 export function validateGatewayIP(value) {
   if (typeof value !== "string" || value.length > 64) {
     throw apiError(
       "INVALID_GATEWAY_IP",
-      "gatewayIP must be a private IPv4 or IPv6 address.",
+      "gatewayIP must be a private IPv4 or unicast IPv6 address.",
       400,
     );
   }
@@ -58,11 +50,11 @@ export function validateGatewayIP(value) {
   if (
     version === 0 ||
     (version === 4 && !isPrivateIPv4(ip)) ||
-    (version === 6 && !isPrivateIPv6(ip))
+    (version === 6 && !isAllowedUnicastIPv6(ip))
   ) {
     throw apiError(
       "INVALID_GATEWAY_IP",
-      "gatewayIP must be a private IPv4 or IPv6 address.",
+      "gatewayIP must be a private IPv4 or unicast IPv6 address.",
       400,
     );
   }
@@ -335,10 +327,20 @@ export class HubManager {
   async #pairNow(gatewayIP) {
     const startedAt = Date.now();
     let accessToken;
+    let resolvedGatewayIP = gatewayIP;
     try {
+      if (!resolvedGatewayIP) {
+        resolvedGatewayIP = validateGatewayIP(
+          await withTimeout(
+            discoverGatewayIP(),
+            GATEWAY_DISCOVERY_TIMEOUT_MS,
+            "GATEWAY_DISCOVERY_TIMEOUT",
+          ),
+        );
+      }
       const pairingClient = await withTimeout(
         createDirigeraClient({
-          gatewayIP: formatGatewayIP(gatewayIP),
+          gatewayIP: formatGatewayIP(resolvedGatewayIP),
           rejectUnauthorized: this.#rejectUnauthorized,
         }),
         HUB_REQUEST_TIMEOUT_MS,
@@ -375,7 +377,7 @@ export class HubManager {
     try {
       this.#config = await this.#persistConfig({
         ...this.#config,
-        gatewayIP,
+        gatewayIP: resolvedGatewayIP,
         accessToken,
       });
     } catch {
@@ -394,7 +396,7 @@ export class HubManager {
     this.#retryDelayMs = 15_000;
     this.#clearRetry();
     await this.connect().catch(() => null);
-    return { paired: true, connected: this.state.connected, gatewayIP };
+    return { paired: true, connected: this.state.connected, gatewayIP: resolvedGatewayIP };
   }
 
   async run(operation) {
