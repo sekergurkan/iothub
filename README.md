@@ -6,8 +6,10 @@ Yuva; IKEA DIRIGERA'ya bağlı ışık, hareket sensörü ve butonları tek bir 
 
 - Oda ve cihaz bazında ışık açma/kapatma, parlaklık ve renk sıcaklığı
 - Hareket sensörü ve butonların pil/son olay bilgileri
-- Hareket, buton basışı veya saat ile başlayan görsel kural oluşturucu
-- Gün ve saat koşulları, gecikmeli kapatma ve kural test etme
+- Hareket başlangıcı/bitimi, butonda tek/çift/uzun basış veya saat ile başlayan 5 adımlı kural oluşturucu
+- Açılmadıkça kural verisine eklenmeyen gün, saat aralığı, cihaz durumu ve tekrar bekleme koşulları
+- Tüm ışıkları, oda grubunu veya tek tek cihazları seçip her ışığa farklı aç/kapat, parlaklık, renk sıcaklığı, geçiş ve otomatik kapanma ayarı
+- BILRESA çift butonun üst ve alt tuşlarını ayrı tetikleyici olarak seçebilme
 - Canlı olay geçmişi ve cihaz bağlantı durumu
 - Hub bulunmadığında tüm ekranları deneyebilmek için demo modu
 - Web UI kapalıyken de kuralları çalıştıran ayrı yerel DIRIGERA köprüsü
@@ -48,7 +50,9 @@ Köprünün API, ağ erişimi ve güvenlik ayarları için [bridge/README.md](br
 
 ## Kurallar nasıl çalışır?
 
-Kural motoru köprü servisinde çalışır ve hareket, buton ve saat olaylarını DIRIGERA'nın WebSocket akışından izler. Kurallar `bridge/.data/rules.json` içinde saklanır. Böylece web sayfasını kapatabilirsiniz; köprü servisi açık kaldığı sürece otomasyonlar devam eder.
+Kural motoru köprü servisinde çalışır ve hareket, buton ve saat olaylarını DIRIGERA'nın WebSocket akışından izler. Bir kural en fazla 32 ışığı yönetebilir; gün/saat filtresi, başka cihazların açık-kapalı/erişilebilir/hareket/pil/parlaklık/sıcaklık durumu ve tekrar çalışma beklemesi birlikte kullanılabilir. Kurallar `bridge/.data/rules.json` içinde saklanır. Böylece web sayfasını kapatabilirsiniz; köprü servisi açık kaldığı sürece otomasyonlar devam eder.
+
+Bir otomasyondaki cihazlardan biri çevrimdışıysa diğer hedeflerin komutları yine denenir ve sonuç geçmiş ekranında hata olarak görünür. Etkinleştirmediğiniz ileri seçenekler kaydedilen kural JSON'una hiç eklenmez; etkinleştirip zorunlu seçimi boş bıraktığınız seçeneklerde arayüz kayda izin vermez.
 
 Köprünün sürekli çalışması için Raspberry Pi, NAS veya evde sürekli açık bir mini PC uygundur. Daha sonra basit kuralların doğrudan DIRIGERA sahnelerine çevrilmesi de eklenebilir; bu durumda köprü kapalıyken de ilgili hub-native kurallar çalışabilir.
 

@@ -51,10 +51,22 @@ test("ships product metadata and removes starter preview artifacts", async () =>
   assert.match(layout, /\/og\.png/);
   assert.match(layout, /lang="tr"/);
   assert.match(client, /function RuleBuilder/);
+  assert.match(client, /DETAYLI OTOMASYON/);
+  assert.match(client, /deviceStates/);
+  assert.match(client, /cooldownSeconds/);
+  assert.match(client, /Tüm ışıkları seç/);
+  assert.match(client, /Odaya göre:/);
+  assert.match(client, /Üst tuş/);
+  assert.match(client, /Yalnızca açtığın koşullar/);
+  assert.match(client, /passthroughAttributes/);
+  assert.match(client, /scheduleTestAutoOff/);
+  assert.match(client, /pendingRuleWritesRef/);
   assert.match(client, /X-Bridge-Key/);
   assert.match(client, /yuva-connection-mode/);
   assert.match(client, /syncBridge\(\)\.catch/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
+  assert.match(css, /\.device-action-card/);
+  assert.match(css, /\.device-condition-row/);
   assert.match(packageJson, /"name": "yuva-dirigera-control"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 

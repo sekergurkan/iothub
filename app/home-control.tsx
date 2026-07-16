@@ -43,12 +43,43 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useId, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type View = "home" | "rooms" | "devices" | "rules" | "activity" | "settings";
 type DeviceType = "light" | "motion" | "button";
-type TriggerType = "motion" | "button" | "time";
+type TriggerType = "motion" | "occupancy" | "button" | "time";
 type ClickPattern = "singlePress" | "doublePress" | "longPress";
+type DeviceStateAttribute =
+  | "isOn"
+  | "isReachable"
+  | "isDetected"
+  | "lightLevel"
+  | "batteryPercentage"
+  | "colorTemperature";
+type DeviceStateOperator =
+  | "equals"
+  | "notEquals"
+  | "greaterThan"
+  | "greaterThanOrEqual"
+  | "lessThan"
+  | "lessThanOrEqual";
+
+type DeviceStateCondition = {
+  deviceId: string;
+  attribute: DeviceStateAttribute;
+  operator: DeviceStateOperator;
+  value: boolean | number;
+};
+
+type AutomationAction = {
+  deviceId: string;
+  isOn?: boolean;
+  brightness?: number;
+  temperature?: number;
+  transitionTime?: number;
+  offAfterSeconds?: number;
+  attributes?: Record<string, unknown>;
+};
 
 type SmartDevice = {
   id: string;
@@ -63,6 +94,7 @@ type SmartDevice = {
   temperature?: number;
   lastEvent?: string;
   automatedBy?: string;
+  controlLabel?: string;
 };
 
 type Room = {
@@ -81,19 +113,18 @@ type AutomationRule = {
     deviceId?: string;
     clickPattern?: ClickPattern;
     time?: string;
+    isDetected?: boolean;
+    days?: string[];
   };
   conditions: {
     startTime?: string;
     endTime?: string;
     days?: string[];
+    deviceStates?: DeviceStateCondition[];
   };
-  actions: Array<{
-    deviceId: string;
-    isOn: boolean;
-    brightness?: number;
-    temperature?: number;
-  }>;
+  actions: AutomationAction[];
   offAfterSeconds?: number;
+  cooldownSeconds?: number;
   lastRun?: string;
   runCount: number;
 };
@@ -124,6 +155,11 @@ type RawDirigeraDevice = {
     isOn?: boolean;
     lightLevel?: number;
     colorTemperature?: number;
+    isDetected?: boolean;
+    isReachable?: boolean;
+    relativePosition?: string[];
+    switchLabel?: string;
+    serialNumber?: string;
   };
 };
 
@@ -339,6 +375,52 @@ const weekDayLabels: Record<string, string> = {
 
 const allWeekDays = Object.keys(weekDayLabels);
 
+const stateAttributeLabels: Record<DeviceStateAttribute, string> = {
+  isOn: "Açık / kapalı",
+  isReachable: "Çevrimiçi",
+  isDetected: "Hareket",
+  lightLevel: "Parlaklık",
+  batteryPercentage: "Pil seviyesi",
+  colorTemperature: "Renk sıcaklığı",
+};
+
+const stateOperatorLabels: Record<DeviceStateOperator, string> = {
+  equals: "eşitse",
+  notEquals: "eşit değilse",
+  greaterThan: "büyükse",
+  greaterThanOrEqual: "en az ise",
+  lessThan: "küçükse",
+  lessThanOrEqual: "en fazla ise",
+};
+
+const numericStateAttributes = new Set<DeviceStateAttribute>([
+  "lightLevel",
+  "batteryPercentage",
+  "colorTemperature",
+]);
+
+function mergedActionAttributes(action: AutomationAction) {
+  const attributes = { ...(action.attributes || {}) };
+  if (action.isOn !== undefined) attributes.isOn = action.isOn;
+  if (action.brightness !== undefined) attributes.lightLevel = action.brightness;
+  if (action.temperature !== undefined) attributes.colorTemperature = action.temperature;
+  return attributes;
+}
+
+function actionSettingsSummary(action: AutomationAction) {
+  const attributes = mergedActionAttributes(action);
+  const details = [
+    attributes.isOn === true ? "aç" : attributes.isOn === false ? "kapat" : "açık/kapalı durumunu koru",
+    typeof attributes.lightLevel === "number" ? `%${attributes.lightLevel}` : null,
+    typeof attributes.colorTemperature === "number" ? `${attributes.colorTemperature}K` : null,
+    action.offAfterSeconds && attributes.isOn === true
+      ? `${Math.round(action.offAfterSeconds / 60)} dk sonra kapat`
+      : null,
+    action.transitionTime !== undefined ? `${action.transitionTime / 1_000} sn geçiş` : null,
+  ].filter(Boolean);
+  return details.join(" · ");
+}
+
 function DeviceGlyph({ type, size = 20 }: { type: DeviceType; size?: number }) {
   if (type === "light") return <Lightbulb size={size} />;
   if (type === "motion") return <Footprints size={size} />;
@@ -382,18 +464,36 @@ function normalizeHome(raw: unknown): SmartDevice[] {
           : ["motionSensor", "occupancySensor"].includes(device.deviceType)
             ? "motion"
             : "button";
+      const position = device.attributes?.relativePosition?.[0]?.toLocaleLowerCase("tr-TR");
+      const controlLabel =
+        position === "top"
+          ? "Üst tuş"
+          : position === "bottom"
+            ? "Alt tuş"
+            : device.attributes?.switchLabel
+              ? device.attributes.switchLabel.replace(/button\s*/i, "Tuş ").trim()
+              : undefined;
+      const sharedRoom = device.attributes?.serialNumber
+        ? rawDevices.find(
+            (candidate) =>
+              candidate.room?.name &&
+              candidate.attributes?.serialNumber === device.attributes?.serialNumber,
+          )?.room?.name
+        : undefined;
+      const baseName = device.attributes?.customName || device.attributes?.model || "İsimsiz cihaz";
       return {
         id: device.id,
-        name: device.attributes?.customName || device.attributes?.model || "İsimsiz cihaz",
-        room: device.room?.name || "Odasız",
+        name: type === "button" && controlLabel ? `${baseName} · ${controlLabel}` : baseName,
+        room: device.room?.name || sharedRoom || "Odasız",
         type,
         model: device.attributes?.model || device.deviceType,
         online: device.isReachable !== false,
         battery: device.attributes?.batteryPercentage,
-        isOn: type === "light" ? Boolean(device.attributes?.isOn) : undefined,
+        isOn: type === "light" && typeof device.attributes?.isOn === "boolean" ? device.attributes.isOn : undefined,
         brightness: device.attributes?.lightLevel,
         temperature: device.attributes?.colorTemperature,
         lastEvent: device.lastSeen,
+        controlLabel,
       };
     });
 }
@@ -457,7 +557,9 @@ function normalizeBridgeEvents(raw: unknown, devices: SmartDevice[]): TimelineEv
 function describeRule(rule: AutomationRule, devices: SmartDevice[]) {
   const triggerDevice = devices.find((device) => device.id === rule.trigger.deviceId)?.name;
   let trigger = "Belirlenen anda";
-  if (rule.trigger.type === "motion") trigger = `${triggerDevice || "Sensör"} hareket algıladığında`;
+  if (rule.trigger.type === "motion" || rule.trigger.type === "occupancy") {
+    trigger = `${triggerDevice || "Sensör"} ${rule.trigger.isDetected === false ? "hareket kesildiğinde" : "hareket algıladığında"}`;
+  }
   if (rule.trigger.type === "button") {
     const click =
       rule.trigger.clickPattern === "doublePress"
@@ -469,14 +571,32 @@ function describeRule(rule: AutomationRule, devices: SmartDevice[]) {
   }
   if (rule.trigger.type === "time") trigger = `Saat ${rule.trigger.time || "--:--"} olduğunda`;
 
-  const targets = rule.actions
-    .map((action) => devices.find((device) => device.id === action.deviceId)?.name)
-    .filter(Boolean);
-  const firstAction = rule.actions[0];
-  const actionText = firstAction?.isOn
-    ? `${targets.join(", ")} ${firstAction.brightness ? `%${firstAction.brightness}` : ""} açılsın`
-    : `${targets.join(", ")} kapatılsın`;
-  return `${trigger}, ${actionText}${rule.offAfterSeconds ? `; ${Math.round(rule.offAfterSeconds / 60)} dk sonra kapansın` : ""}.`;
+  const filters: string[] = [];
+  const applicableDays = rule.conditions.days || rule.trigger.days;
+  if (applicableDays?.length) {
+    filters.push(applicableDays.map((day) => weekDayLabels[day] || day).join(", "));
+  }
+  if (rule.conditions.startTime && rule.conditions.endTime) {
+    filters.push(`${rule.conditions.startTime}–${rule.conditions.endTime} arasında`);
+  }
+  if (rule.conditions.deviceStates?.length) {
+    filters.push(`${rule.conditions.deviceStates.length} cihaz koşulu sağlandığında`);
+  }
+
+  const actions = rule.actions.map((action) => {
+    const target = devices.find((device) => device.id === action.deviceId)?.name || "Seçili ışık";
+    const attributes = mergedActionAttributes(action);
+    if (attributes.isOn === false) return `${target} kapansın`;
+    const details = [
+      typeof attributes.lightLevel === "number" ? `%${attributes.lightLevel}` : null,
+      typeof attributes.colorTemperature === "number" ? `${attributes.colorTemperature}K` : null,
+    ].filter(Boolean);
+    const autoOff = action.offAfterSeconds ?? rule.offAfterSeconds;
+    const verb = attributes.isOn === true ? "açılsın" : "durumu korunarak ayarlansın";
+    return `${target}${details.length ? ` ${details.join(" · ")}` : ""} ${verb}${autoOff && attributes.isOn === true ? `, ${Math.round(autoOff / 60)} dk sonra kapansın` : ""}`;
+  });
+
+  return `${trigger}${filters.length ? `; yalnızca ${filters.join(" ve ")}` : ""}. ${actions.join("; ")}.${rule.cooldownSeconds ? ` Yeniden çalışmadan önce ${Math.round(rule.cooldownSeconds / 60)} dk bekler.` : ""}`;
 }
 
 function Switch({ checked, onChange, label }: { checked: boolean; onChange: () => void; label: string }) {
@@ -527,6 +647,10 @@ export function HomeControl() {
   });
   const [lastSync, setLastSync] = useState("şimdi");
   const [welcome, setWelcome] = useState({ greeting: "Merhaba", date: "Bugün" });
+  const rulesRevisionRef = useRef(0);
+  const pendingRuleWritesRef = useRef(0);
+  const testOffTimersRef = useRef(new Map<string, number>());
+  const toastTimerRef = useRef<number | null>(null);
 
   const lights = useMemo(() => devices.filter((device) => device.type === "light"), [devices]);
   const activeLights = lights.filter((device) => device.isOn).length;
@@ -546,7 +670,11 @@ export function HomeControl() {
 
   const showToast = useCallback((message: string) => {
     setToast(message);
-    window.setTimeout(() => setToast(null), 2800);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null;
+      setToast(null);
+    }, 2800);
   }, []);
 
   useEffect(() => {
@@ -569,6 +697,20 @@ export function HomeControl() {
     return () => window.clearTimeout(timer);
   }, []);
 
+  useEffect(() => {
+    const timers = testOffTimersRef.current;
+    for (const timer of timers.values()) window.clearTimeout(timer);
+    timers.clear();
+    return () => {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
+    };
+  }, [mode, bridgeSettings.url, bridgeSettings.key]);
+
+  useEffect(() => () => {
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+  }, []);
+
   const bridgeFetch = useCallback(
     (path: string, init?: RequestInit) => requestBridge(bridgeSettings, path, init),
     [bridgeSettings],
@@ -577,17 +719,28 @@ export function HomeControl() {
   const syncBridge = useCallback(async (settingsOverride?: BridgeSettings) => {
     const settings = settingsOverride || bridgeSettings;
     if (!settings.key) return false;
+    const rulesRevision = rulesRevisionRef.current;
     const status = await requestBridge(settings, "/api/status");
     if (!status.connected) throw new Error("DIRIGERA henüz eşleştirilmemiş");
     const home = await requestBridge(settings, "/api/home");
     const normalized = normalizeHome(home);
     setDevices(normalized);
-    const [rulesPayload, eventsPayload] = await Promise.all([
-      requestBridge(settings, "/api/rules").catch(() => []),
+    const [rulesResult, eventsPayload] = await Promise.all([
+      requestBridge(settings, "/api/rules")
+        .then((payload) => ({ ok: true as const, payload }))
+        .catch(() => ({ ok: false as const, payload: null })),
       requestBridge(settings, "/api/events?limit=100").catch(() => ({ events: [] })),
     ]);
-    const bridgeRules = Array.isArray(rulesPayload) ? rulesPayload : Array.isArray(rulesPayload?.rules) ? rulesPayload.rules : [];
-    if (Array.isArray(bridgeRules)) setRules(bridgeRules);
+    const rulesPayload = rulesResult.payload;
+    const bridgeRules = Array.isArray(rulesPayload) ? rulesPayload : Array.isArray(rulesPayload?.rules) ? rulesPayload.rules : null;
+    if (
+      rulesResult.ok &&
+      bridgeRules &&
+      rulesRevision === rulesRevisionRef.current &&
+      pendingRuleWritesRef.current === 0
+    ) {
+      setRules(bridgeRules);
+    }
     setTimeline(normalizeBridgeEvents(eventsPayload, normalized));
     setMode("bridge");
     setBridgeOnline(true);
@@ -609,17 +762,72 @@ export function HomeControl() {
     };
   }, [bridgeSettings.key, mode, syncBridge]);
 
-  async function sendDeviceAttributes(id: string, attributes: Record<string, unknown>) {
+  async function sendDeviceAttributes(id: string, attributes: Record<string, unknown>, transitionTime?: number) {
     if (mode !== "bridge") return;
     await bridgeFetch(`/api/devices/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ attributes }),
+      body: JSON.stringify({ attributes, ...(transitionTime !== undefined ? { transitionTime } : {}) }),
     });
+  }
+
+  async function sendLightAttributes(
+    id: string,
+    attributes: Record<string, unknown>,
+    transitionTime?: number,
+  ) {
+    const remaining = { ...attributes };
+    const isOn = typeof remaining.isOn === "boolean" ? remaining.isOn : undefined;
+    delete remaining.isOn;
+    const requests: Array<Record<string, unknown>> = [];
+    if (isOn === true) requests.push({ isOn: true });
+    for (const attribute of ["lightLevel", "colorTemperature"]) {
+      if (remaining[attribute] !== undefined) {
+        requests.push({ [attribute]: remaining[attribute] });
+        delete remaining[attribute];
+      }
+    }
+    if (Object.keys(remaining).length) requests.push(remaining);
+    if (isOn === false) requests.push({ isOn: false });
+
+    const failures: unknown[] = [];
+    for (const request of requests) {
+      try {
+        await sendDeviceAttributes(id, request, transitionTime);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length) throw failures[0];
+  }
+
+  function cancelTestOffTimer(deviceId: string) {
+    const timer = testOffTimersRef.current.get(deviceId);
+    if (timer !== undefined) window.clearTimeout(timer);
+    testOffTimersRef.current.delete(deviceId);
+  }
+
+  function scheduleTestAutoOff(rule: AutomationRule, action: AutomationAction) {
+    const attributes = mergedActionAttributes(action);
+    const delay = action.offAfterSeconds ?? rule.offAfterSeconds;
+    if (attributes.isOn !== true || !delay) return;
+    cancelTestOffTimer(action.deviceId);
+    const timer = window.setTimeout(() => {
+      testOffTimersRef.current.delete(action.deviceId);
+      setDevices((current) => current.map((device) =>
+        device.id === action.deviceId ? { ...device, isOn: false } : device,
+      ));
+      sendLightAttributes(action.deviceId, { isOn: false }, action.transitionTime).catch(() => {
+        showToast("Test otomatik kapatma komutu iletilemedi");
+        syncBridge().catch(() => setBridgeOnline(false));
+      });
+    }, delay * 1_000);
+    testOffTimersRef.current.set(action.deviceId, timer);
   }
 
   function toggleLight(id: string) {
     const device = devices.find((item) => item.id === id);
     if (!device || !device.online) return;
+    cancelTestOffTimer(id);
     const next = !device.isOn;
     setDevices((current) => current.map((item) => (item.id === id ? { ...item, isOn: next } : item)));
     setTimeline((current) => [
@@ -640,18 +848,20 @@ export function HomeControl() {
   }
 
   function setBrightness(id: string, brightness: number) {
+    cancelTestOffTimer(id);
     setDevices((current) =>
       current.map((item) => (item.id === id ? { ...item, brightness, isOn: true } : item)),
     );
   }
 
   function commitBrightness(id: string, brightness: number) {
-    sendDeviceAttributes(id, { isOn: true, lightLevel: brightness }).catch(() =>
+    sendLightAttributes(id, { isOn: true, lightLevel: brightness }).catch(() =>
       showToast("Parlaklık komutu iletilemedi"),
     );
   }
 
   function setAllLights(isOn: boolean) {
+    for (const light of lights) cancelTestOffTimer(light.id);
     setDevices((current) => current.map((device) => (device.type === "light" ? { ...device, isOn } : device)));
     showToast(isOn ? "Tüm ışıklar açıldı" : "Evdeki tüm ışıklar kapatıldı");
     if (mode === "bridge") {
@@ -662,6 +872,7 @@ export function HomeControl() {
   }
 
   function applyEveningScene() {
+    for (const light of lights) cancelTestOffTimer(light.id);
     const attributesFor = (device: SmartDevice) => ({
       isOn: device.room !== "Yatak Odası",
       lightLevel: device.room === "Koridor" ? 20 : 65,
@@ -676,7 +887,7 @@ export function HomeControl() {
     );
     showToast("Akşam modu hazır");
     if (mode === "bridge") {
-      Promise.all(lights.map((light) => sendDeviceAttributes(light.id, attributesFor(light)))).catch(() =>
+      Promise.all(lights.map((light) => sendLightAttributes(light.id, attributesFor(light)))).catch(() =>
         showToast("Akşam modu bazı ışıklara iletilemedi"),
       );
     }
@@ -684,6 +895,7 @@ export function HomeControl() {
 
   function toggleRoom(roomName: string) {
     const roomLights = lights.filter((device) => device.room === roomName);
+    for (const light of roomLights) cancelTestOffTimer(light.id);
     const shouldTurnOn = roomLights.every((device) => !device.isOn);
     setDevices((current) =>
       current.map((device) => (device.room === roomName && device.type === "light" ? { ...device, isOn: shouldTurnOn } : device)),
@@ -697,18 +909,28 @@ export function HomeControl() {
     }
   }
 
-  function saveRule(rule: AutomationRule) {
+  async function saveRule(rule: AutomationRule) {
     const existing = rules.some((item) => item.id === rule.id);
-    setRules((current) => (existing ? current.map((item) => (item.id === rule.id ? rule : item)) : [rule, ...current]));
+    let savedRule = rule;
+    if (mode === "bridge") {
+      rulesRevisionRef.current += 1;
+      pendingRuleWritesRef.current += 1;
+      try {
+        savedRule = await bridgeFetch(`/api/rules${existing ? `/${rule.id}` : ""}`, {
+          method: existing ? "PUT" : "POST",
+          body: JSON.stringify(rule),
+        });
+      } catch (error) {
+        showToast(error instanceof Error ? `Kural kaydedilemedi: ${error.message}` : "Kural köprüye kaydedilemedi");
+        return;
+      } finally {
+        pendingRuleWritesRef.current -= 1;
+      }
+    }
+    setRules((current) => (existing ? current.map((item) => (item.id === rule.id ? savedRule : item)) : [savedRule, ...current]));
     setRuleModalOpen(false);
     setEditingRule(null);
     showToast(existing ? "Kural güncellendi" : "Yeni kural etkinleştirildi");
-    if (mode === "bridge") {
-      bridgeFetch(`/api/rules${existing ? `/${rule.id}` : ""}`, {
-        method: existing ? "PUT" : "POST",
-        body: JSON.stringify(rule),
-      }).catch(() => showToast("Kural köprüye kaydedilemedi"));
-    }
   }
 
   function toggleRule(id: string) {
@@ -718,37 +940,61 @@ export function HomeControl() {
     setRules((current) => current.map((rule) => (rule.id === id ? updated : rule)));
     showToast(updated.enabled ? "Kural etkin" : "Kural duraklatıldı");
     if (mode === "bridge") {
-      bridgeFetch(`/api/rules/${id}`, { method: "PUT", body: JSON.stringify(updated) }).catch(() =>
-        showToast("Kural durumu köprüye iletilemedi"),
-      );
+      rulesRevisionRef.current += 1;
+      pendingRuleWritesRef.current += 1;
+      bridgeFetch(`/api/rules/${id}`, { method: "PUT", body: JSON.stringify(updated) })
+        .then((savedRule) => setRules((current) => current.map((rule) => (rule.id === id ? savedRule : rule))))
+        .catch(() => {
+          setRules((current) => current.map((rule) => (rule.id === id ? target : rule)));
+          showToast("Kural durumu köprüye iletilemedi; önceki duruma dönüldü");
+        })
+        .finally(() => { pendingRuleWritesRef.current -= 1; });
     }
   }
 
   function testRule(rule: AutomationRule) {
+    for (const action of rule.actions) cancelTestOffTimer(action.deviceId);
     setDevices((current) =>
       current.map((device) => {
         const action = rule.actions.find((item) => item.deviceId === device.id);
+        const attributes = action ? mergedActionAttributes(action) : null;
         return action
           ? {
               ...device,
-              isOn: action.isOn,
-              brightness: action.brightness ?? device.brightness,
-              temperature: action.temperature ?? device.temperature,
+              ...(typeof attributes?.isOn === "boolean" ? { isOn: attributes.isOn } : {}),
+              ...(typeof attributes?.lightLevel === "number" ? { brightness: attributes.lightLevel } : {}),
+              ...(typeof attributes?.colorTemperature === "number" ? { temperature: attributes.colorTemperature } : {}),
             }
           : device;
       }),
     );
     showToast(`“${rule.name}” test edildi`);
     if (mode === "bridge") {
-      Promise.all(
+      Promise.allSettled(
         rule.actions.map((action) =>
-          sendDeviceAttributes(action.deviceId, {
-            isOn: action.isOn,
-            ...(action.brightness !== undefined ? { lightLevel: action.brightness } : {}),
-            ...(action.temperature !== undefined ? { colorTemperature: action.temperature } : {}),
-          }),
+          sendLightAttributes(
+            action.deviceId,
+            mergedActionAttributes(action),
+            action.transitionTime,
+          ),
         ),
-      ).catch(() => showToast("Test eylemlerinin bazıları iletilemedi"));
+      ).then((results) => {
+        const failures = results.filter((result) => result.status === "rejected").length;
+        results.forEach((result, index) => {
+          if (
+            result.status === "fulfilled" ||
+            mergedActionAttributes(rule.actions[index]).isOn === true
+          ) {
+            scheduleTestAutoOff(rule, rule.actions[index]);
+          }
+        });
+        if (failures) {
+          showToast(`${failures} cihaz test komutunu tamamlayamadı`);
+          syncBridge().catch(() => setBridgeOnline(false));
+        }
+      });
+    } else {
+      for (const action of rule.actions) scheduleTestAutoOff(rule, action);
     }
   }
 
@@ -756,9 +1002,12 @@ export function HomeControl() {
     setRules((current) => current.filter((item) => item.id !== rule.id));
     showToast("Kural silindi");
     if (mode === "bridge") {
-      bridgeFetch(`/api/rules/${rule.id}`, { method: "DELETE" }).catch(() =>
-        showToast("Kural köprüden silinemedi"),
-      );
+      rulesRevisionRef.current += 1;
+      pendingRuleWritesRef.current += 1;
+      bridgeFetch(`/api/rules/${rule.id}`, { method: "DELETE" }).catch(() => {
+        setRules((current) => current.some((item) => item.id === rule.id) ? current : [rule, ...current]);
+        showToast("Kural köprüden silinemedi; listeye geri alındı");
+      }).finally(() => { pendingRuleWritesRef.current -= 1; });
     }
   }
 
@@ -907,6 +1156,7 @@ export function HomeControl() {
                 setMode("demo");
                 setBridgeOnline(false);
                 setDevices(initialDevices);
+                rulesRevisionRef.current += 1;
                 setRules(initialRules);
                 setTimeline(initialTimeline);
                 showToast("Demo evine dönüldü");
@@ -965,6 +1215,7 @@ export function HomeControl() {
             setMode("demo");
             setBridgeOnline(false);
             setDevices(initialDevices);
+            rulesRevisionRef.current += 1;
             setRules(initialRules);
             setTimeline(initialTimeline);
             setConnectionModalOpen(false);
@@ -1140,7 +1391,7 @@ function RulesView({ rules, devices, toggleRule, testRule, editRule, deleteRule 
     <div className="rules-layout">
       <section className="rules-list">
         {rules.map((rule) => {
-          const TriggerIcon = rule.trigger.type === "motion" ? Footprints : rule.trigger.type === "button" ? MousePointerClick : Clock3;
+          const TriggerIcon = rule.trigger.type === "motion" || rule.trigger.type === "occupancy" ? Footprints : rule.trigger.type === "button" ? MousePointerClick : Clock3;
           return (
             <article className={`rule-card ${rule.enabled ? "is-enabled" : ""}`} key={rule.id}>
               <span className="rule-icon"><TriggerIcon size={21} /></span>
@@ -1195,80 +1446,472 @@ function SettingRow({ title, copy, checked }: { title: string; copy: string; che
   return <div className="setting-row"><span><b>{title}</b><small>{copy}</small></span><Switch checked={value} onChange={() => setValue((current) => !current)} label={`${title} ayarı`} /></div>;
 }
 
-function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { devices: SmartDevice[]; initialRule: AutomationRule | null; onClose: () => void; onSave: (rule: AutomationRule) => void; onTest: (rule: AutomationRule) => void }) {
+type ActionEditorState = {
+  deviceId: string;
+  isOn?: boolean;
+  passthroughAttributes?: Record<string, unknown>;
+  brightnessEnabled: boolean;
+  brightness: number;
+  temperatureEnabled: boolean;
+  temperature: number;
+  transitionEnabled: boolean;
+  transitionSeconds: number;
+  autoOffEnabled: boolean;
+  autoOffMinutes: number;
+};
+
+type DeviceStateEditor = DeviceStateCondition & { editorId: string };
+
+function stateAttributesForDevice(device: SmartDevice | undefined): DeviceStateAttribute[] {
+  if (!device) return ["isReachable"];
+  const attributes: DeviceStateAttribute[] = ["isReachable"];
+  if (device.type === "light") {
+    if (device.isOn !== undefined) attributes.unshift("isOn");
+    if (device.brightness !== undefined) attributes.push("lightLevel");
+    if (device.temperature !== undefined) attributes.push("colorTemperature");
+  } else if (device.type === "motion") {
+    attributes.unshift("isDetected");
+    if (device.battery !== undefined) attributes.push("batteryPercentage");
+  } else if (device.battery !== undefined) {
+    attributes.unshift("batteryPercentage");
+  }
+  return attributes;
+}
+
+function defaultStateValue(attribute: DeviceStateAttribute): boolean | number {
+  if (numericStateAttributes.has(attribute)) return attribute === "colorTemperature" ? 2700 : 50;
+  return true;
+}
+
+function stateValueLabels(attribute: DeviceStateAttribute) {
+  if (attribute === "isOn") return ["Açık", "Kapalı"];
+  if (attribute === "isDetected") return ["Algılandı", "Algılanmadı"];
+  return ["Çevrimiçi", "Çevrimdışı"];
+}
+
+function OptionalSetting({ enabled, title, copy, onToggle, children }: { enabled: boolean; title: string; copy: string; onToggle: () => void; children?: React.ReactNode }) {
+  return (
+    <section className={`optional-setting ${enabled ? "is-enabled" : ""}`}>
+      <div className="optional-setting-head">
+        <span><b>{title}</b><small>{copy}</small></span>
+        <Switch checked={enabled} onChange={onToggle} label={`${title} seçeneği`} />
+      </div>
+      {enabled && <div className="optional-setting-body">{children}</div>}
+    </section>
+  );
+}
+
+function RuleBuilder({ devices, initialRule, onClose, onSave, onTest }: { devices: SmartDevice[]; initialRule: AutomationRule | null; onClose: () => void; onSave: (rule: AutomationRule) => Promise<void>; onTest: (rule: AutomationRule) => void }) {
   const sensors = devices.filter((device) => device.type === "motion");
   const buttons = devices.filter((device) => device.type === "button");
   const lights = devices.filter((device) => device.type === "light");
+  const [generatedId] = useState(() => `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`);
   const [step, setStep] = useState(1);
-  const [name, setName] = useState(initialRule?.name || "Yeni ev kuralı");
-  const [triggerType, setTriggerType] = useState<TriggerType>(initialRule?.trigger.type || "motion");
-  const [triggerDevice, setTriggerDevice] = useState(initialRule?.trigger.deviceId || sensors[0]?.id || buttons[0]?.id || "");
+  const [saving, setSaving] = useState(false);
+  const [name, setName] = useState(initialRule?.name || "");
+  const [enabled, setEnabled] = useState(initialRule?.enabled ?? true);
+  const [triggerType, setTriggerType] = useState<TriggerType>(initialRule?.trigger.type === "occupancy" ? "motion" : initialRule?.trigger.type || "motion");
+  const [triggerDevice, setTriggerDevice] = useState(initialRule?.trigger.deviceId || sensors[0]?.id || "");
+  const [motionDetected, setMotionDetected] = useState(initialRule?.trigger.isDetected ?? true);
   const [clickPattern, setClickPattern] = useState<ClickPattern>(initialRule?.trigger.clickPattern || "singlePress");
   const [triggerTime, setTriggerTime] = useState(initialRule?.trigger.time || "20:00");
+  const existingDays = initialRule?.conditions.days?.length ? initialRule.conditions.days : initialRule?.trigger.days;
+  const [daysEnabled, setDaysEnabled] = useState(Boolean(existingDays?.length));
+  const [days, setDays] = useState(existingDays?.length ? existingDays : allWeekDays);
+  const [timeWindowEnabled, setTimeWindowEnabled] = useState(Boolean(initialRule?.conditions.startTime && initialRule?.conditions.endTime));
   const [startTime, setStartTime] = useState(initialRule?.conditions.startTime || "18:00");
   const [endTime, setEndTime] = useState(initialRule?.conditions.endTime || "06:00");
-  const [days, setDays] = useState(initialRule?.conditions.days || allWeekDays);
-  const [targetDevice, setTargetDevice] = useState(initialRule?.actions[0]?.deviceId || lights[0]?.id || "");
-  const [actionOn, setActionOn] = useState(initialRule?.actions[0]?.isOn ?? true);
-  const [brightness, setBrightnessValue] = useState(initialRule?.actions[0]?.brightness || 35);
-  const [temperature, setTemperature] = useState(initialRule?.actions[0]?.temperature || 2700);
-  const [offAfter, setOffAfter] = useState(initialRule?.offAfterSeconds ? Math.round(initialRule.offAfterSeconds / 60) : 2);
-  const generatedId = useId();
+  const initialStateConditions = initialRule?.conditions.deviceStates || [];
+  const [deviceConditionsEnabled, setDeviceConditionsEnabled] = useState(initialStateConditions.length > 0);
+  const [deviceConditions, setDeviceConditions] = useState<DeviceStateEditor[]>(
+    initialStateConditions.map((condition, index) => ({ ...condition, editorId: `existing-${index}` })),
+  );
+  const [cooldownEnabled, setCooldownEnabled] = useState(Boolean(initialRule?.cooldownSeconds));
+  const [cooldownMinutes, setCooldownMinutes] = useState(initialRule?.cooldownSeconds ? Math.max(1, Math.round(initialRule.cooldownSeconds / 60)) : 1);
+  const firstActionAttributes = initialRule?.actions[0] ? mergedActionAttributes(initialRule.actions[0]) : {};
+  const [bulkOn, setBulkOn] = useState(typeof firstActionAttributes.isOn === "boolean" ? firstActionAttributes.isOn : true);
+  const [bulkBrightnessEnabled, setBulkBrightnessEnabled] = useState(typeof firstActionAttributes.lightLevel === "number");
+  const [bulkBrightness, setBulkBrightness] = useState(typeof firstActionAttributes.lightLevel === "number" ? firstActionAttributes.lightLevel : 30);
+  const [bulkTemperatureEnabled, setBulkTemperatureEnabled] = useState(typeof firstActionAttributes.colorTemperature === "number");
+  const [bulkTemperature, setBulkTemperature] = useState(typeof firstActionAttributes.colorTemperature === "number" ? firstActionAttributes.colorTemperature : 2700);
+  const [bulkTransitionEnabled, setBulkTransitionEnabled] = useState(initialRule?.actions[0]?.transitionTime !== undefined);
+  const [bulkTransitionSeconds, setBulkTransitionSeconds] = useState(initialRule?.actions[0]?.transitionTime !== undefined ? initialRule.actions[0].transitionTime / 1000 : 1);
+  const firstAutoOff = initialRule?.actions[0]?.offAfterSeconds ?? initialRule?.offAfterSeconds;
+  const [bulkAutoOffEnabled, setBulkAutoOffEnabled] = useState(firstAutoOff !== undefined);
+  const [bulkAutoOffMinutes, setBulkAutoOffMinutes] = useState(firstAutoOff ? Math.max(1, Math.round(firstAutoOff / 60)) : 2);
+  const [actionEditors, setActionEditors] = useState<ActionEditorState[]>(
+    (initialRule?.actions || []).map((action) => {
+      const actionAutoOff = action.offAfterSeconds ?? initialRule?.offAfterSeconds;
+      const attributes = mergedActionAttributes(action);
+      const passthroughAttributes = Object.fromEntries(
+        Object.entries(action.attributes || {}).filter(
+          ([key]) => !["isOn", "lightLevel", "colorTemperature"].includes(key),
+        ),
+      );
+      const actionIsOn = typeof attributes.isOn === "boolean" ? attributes.isOn : undefined;
+      return {
+        deviceId: action.deviceId,
+        isOn: actionIsOn,
+        ...(Object.keys(passthroughAttributes).length ? { passthroughAttributes } : {}),
+        brightnessEnabled: typeof attributes.lightLevel === "number",
+        brightness: typeof attributes.lightLevel === "number" ? attributes.lightLevel : 30,
+        temperatureEnabled: typeof attributes.colorTemperature === "number",
+        temperature: typeof attributes.colorTemperature === "number" ? attributes.colorTemperature : 2700,
+        transitionEnabled: action.transitionTime !== undefined,
+        transitionSeconds: action.transitionTime !== undefined ? action.transitionTime / 1000 : 1,
+        autoOffEnabled: actionAutoOff !== undefined,
+        autoOffMinutes: actionAutoOff ? Math.max(1, Math.round(actionAutoOff / 60)) : 2,
+      };
+    }),
+  );
+
+  const createBulkAction = (deviceId: string): ActionEditorState => {
+    const device = lights.find((light) => light.id === deviceId);
+    return {
+      deviceId,
+      isOn: bulkOn,
+      brightnessEnabled: bulkOn && bulkBrightnessEnabled && device?.brightness !== undefined,
+      brightness: bulkBrightness,
+      temperatureEnabled: bulkOn && bulkTemperatureEnabled && device?.temperature !== undefined,
+      temperature: bulkTemperature,
+      transitionEnabled: bulkTransitionEnabled,
+      transitionSeconds: bulkTransitionSeconds,
+      autoOffEnabled: bulkOn && bulkAutoOffEnabled,
+      autoOffMinutes: bulkAutoOffMinutes,
+    };
+  };
 
   function selectTriggerType(nextType: TriggerType) {
     setTriggerType(nextType);
     const options = nextType === "motion" ? sensors : nextType === "button" ? buttons : [];
-    if (options.length && !options.some((device) => device.id === triggerDevice)) {
-      setTriggerDevice(options[0].id);
+    if (nextType !== "time" && !options.some((device) => device.id === triggerDevice)) {
+      setTriggerDevice(options[0]?.id || "");
     }
   }
 
+  function toggleDay(day: string) {
+    setDays((current) => current.includes(day) ? current.filter((item) => item !== day) : [...current, day]);
+  }
+
+  function toggleActionDevice(deviceId: string) {
+    setActionEditors((current) => {
+      if (current.some((action) => action.deviceId === deviceId)) return current.filter((action) => action.deviceId !== deviceId);
+      if (current.length >= 32) return current;
+      return [...current, createBulkAction(deviceId)];
+    });
+  }
+
+  function selectAllLights() {
+    setActionEditors((current) => {
+      const lightIds = new Set(lights.map((light) => light.id));
+      const preserved = current.filter((action) => !lightIds.has(action.deviceId));
+      const allLightsSelected = lights.length > 0 && lights.every((light) =>
+        current.some((action) => action.deviceId === light.id),
+      );
+      if (allLightsSelected) return preserved;
+      const selectedLights = lights
+        .slice(0, Math.max(0, 32 - preserved.length))
+        .map((light) => current.find((action) => action.deviceId === light.id) || createBulkAction(light.id));
+      return [...preserved, ...selectedLights];
+    });
+  }
+
+  function selectRoomLights(room: string) {
+    const roomLights = lights.filter((light) => light.room === room);
+    const roomIds = new Set(roomLights.map((light) => light.id));
+    setActionEditors((current) => {
+      const allSelected = roomLights.length > 0 && roomLights.every((light) => current.some((action) => action.deviceId === light.id));
+      if (allSelected) return current.filter((action) => !roomIds.has(action.deviceId));
+      const existingIds = new Set(current.map((action) => action.deviceId));
+      const additions = roomLights.filter((light) => !existingIds.has(light.id)).map((light) => createBulkAction(light.id));
+      return [...current, ...additions].slice(0, 32);
+    });
+  }
+
+  function updateAction(deviceId: string, patch: Partial<ActionEditorState>) {
+    setActionEditors((current) => current.map((action) => action.deviceId === deviceId ? { ...action, ...patch } : action));
+  }
+
+  function applyBulkSettings() {
+    setActionEditors((current) => current.map((action) =>
+      lights.some((light) => light.id === action.deviceId)
+        ? { ...action, ...createBulkAction(action.deviceId) }
+        : action,
+    ));
+  }
+
+  function makeDeviceCondition(): DeviceStateEditor {
+    const device = devices[0];
+    const attribute = stateAttributesForDevice(device)[0];
+    return {
+      editorId: `condition-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      deviceId: device?.id || "",
+      attribute,
+      operator: "equals",
+      value: defaultStateValue(attribute),
+    };
+  }
+
+  function toggleDeviceConditions() {
+    setDeviceConditionsEnabled((current) => {
+      if (!current && deviceConditions.length === 0) setDeviceConditions([makeDeviceCondition()]);
+      return !current;
+    });
+  }
+
+  function updateDeviceCondition(editorId: string, patch: Partial<DeviceStateCondition>) {
+    setDeviceConditions((current) => current.map((condition) => condition.editorId === editorId ? { ...condition, ...patch } : condition));
+  }
+
+  function changeConditionDevice(condition: DeviceStateEditor, deviceId: string) {
+    const device = devices.find((item) => item.id === deviceId);
+    const attributes = stateAttributesForDevice(device);
+    const attribute = attributes.includes(condition.attribute) ? condition.attribute : attributes[0];
+    updateDeviceCondition(condition.editorId, {
+      deviceId,
+      attribute,
+      operator: numericStateAttributes.has(attribute) ? "greaterThanOrEqual" : "equals",
+      value: defaultStateValue(attribute),
+    });
+  }
+
+  function changeConditionAttribute(condition: DeviceStateEditor, attribute: DeviceStateAttribute) {
+    updateDeviceCondition(condition.editorId, {
+      attribute,
+      operator: numericStateAttributes.has(attribute) ? "greaterThanOrEqual" : "equals",
+      value: defaultStateValue(attribute),
+    });
+  }
+
+  const actions: AutomationAction[] = actionEditors.map((action) => ({
+    deviceId: action.deviceId,
+    ...(action.isOn !== undefined ? { isOn: action.isOn } : {}),
+    ...(action.passthroughAttributes && Object.keys(action.passthroughAttributes).length
+      ? { attributes: action.passthroughAttributes }
+      : {}),
+    ...(action.isOn !== false && action.brightnessEnabled ? { brightness: Math.round(action.brightness) } : {}),
+    ...(action.isOn !== false && action.temperatureEnabled ? { temperature: Math.round(action.temperature) } : {}),
+    ...(action.transitionEnabled ? { transitionTime: Math.round(action.transitionSeconds * 1000) } : {}),
+    ...(action.isOn && action.autoOffEnabled ? { offAfterSeconds: Math.round(action.autoOffMinutes * 60) } : {}),
+  }));
+
   const draft: AutomationRule = {
-    id: initialRule?.id || `rule-${generatedId.replace(/:/g, "")}`,
-    name,
-    enabled: initialRule?.enabled ?? true,
-    trigger: { type: triggerType, deviceId: triggerType === "time" ? undefined : triggerDevice, clickPattern: triggerType === "button" ? clickPattern : undefined, time: triggerType === "time" ? triggerTime : undefined },
-    conditions: { startTime: triggerType === "time" ? undefined : startTime, endTime: triggerType === "time" ? undefined : endTime, days },
-    actions: [{ deviceId: targetDevice, isOn: actionOn, brightness: actionOn ? brightness : undefined, temperature: actionOn ? temperature : undefined }],
-    offAfterSeconds: actionOn && offAfter > 0 ? offAfter * 60 : undefined,
+    id: initialRule?.id || generatedId,
+    name: name.trim(),
+    enabled,
+    trigger: {
+      type: triggerType,
+      ...(triggerType !== "time" ? { deviceId: triggerDevice } : {}),
+      ...(triggerType === "motion" ? { isDetected: motionDetected } : {}),
+      ...(triggerType === "button" ? { clickPattern } : {}),
+      ...(triggerType === "time" ? { time: triggerTime } : {}),
+    },
+    conditions: {
+      ...(daysEnabled && days.length ? { days } : {}),
+      ...(timeWindowEnabled ? { startTime, endTime } : {}),
+      ...(deviceConditionsEnabled && deviceConditions.length
+        ? { deviceStates: deviceConditions.map((condition) => ({ deviceId: condition.deviceId, attribute: condition.attribute, operator: condition.operator, value: condition.value })) }
+        : {}),
+    },
+    actions,
+    ...(cooldownEnabled ? { cooldownSeconds: Math.round(cooldownMinutes * 60) } : {}),
     lastRun: initialRule?.lastRun,
-    runCount: initialRule?.runCount || 0,
+    runCount: initialRule?.runCount ?? 0,
   };
+
+  function errorsForStep(targetStep: number) {
+    const errors: string[] = [];
+    if (targetStep === 1) {
+      if (!name.trim()) errors.push("Kuralın ne yaptığını anlatan bir ad yazmalısın.");
+      if (name.trim().length > 120) errors.push("Kural adı 120 karakterden kısa olmalı.");
+    }
+    if (targetStep === 2) {
+      if (triggerType === "motion" && !sensors.some((device) => device.id === triggerDevice)) errors.push("Bir hareket sensörü seçmelisin.");
+      if (triggerType === "button" && !buttons.some((device) => device.id === triggerDevice)) errors.push("Bir buton veya tuş seçmelisin.");
+      if (triggerType === "time" && !/^([01]\d|2[0-3]):[0-5]\d$/.test(triggerTime)) errors.push("Geçerli bir çalışma saati seçmelisin.");
+    }
+    if (targetStep === 3) {
+      if (daysEnabled && days.length === 0) errors.push("Gün filtresi açıkken en az bir gün seçmelisin.");
+      if (timeWindowEnabled && (!/^([01]\d|2[0-3]):[0-5]\d$/.test(startTime) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(endTime))) errors.push("Saat aralığının başlangıç ve bitişini seçmelisin.");
+      if (deviceConditionsEnabled && deviceConditions.length === 0) errors.push("Cihaz koşulları açıkken en az bir koşul eklemelisin.");
+      if (deviceConditionsEnabled && deviceConditions.length > 32) errors.push("Bir kurala en fazla 32 cihaz durumu koşulu ekleyebilirsin.");
+      if (deviceConditionsEnabled && deviceConditions.some((condition) => !devices.some((device) => device.id === condition.deviceId))) errors.push("Her cihaz koşulu için geçerli bir cihaz seçmelisin.");
+      if (deviceConditionsEnabled && deviceConditions.some((condition) => {
+        const device = devices.find((item) => item.id === condition.deviceId);
+        return !stateAttributesForDevice(device).includes(condition.attribute);
+      })) errors.push("Bir cihaz koşulunda, seçilen cihazın desteklemediği bir özellik var.");
+      if (deviceConditionsEnabled && deviceConditions.some((condition) => {
+        if (typeof condition.value !== "number" || !Number.isFinite(condition.value)) return numericStateAttributes.has(condition.attribute);
+        if (condition.attribute === "colorTemperature") return condition.value < 1500 || condition.value > 6500;
+        if (condition.attribute === "lightLevel" || condition.attribute === "batteryPercentage") return condition.value < 0 || condition.value > 100;
+        return false;
+      })) errors.push("Cihaz koşullarında parlaklık/pil 0–100, renk sıcaklığı 1500K–6500K arasında olmalı.");
+      if (cooldownEnabled && (!Number.isFinite(cooldownMinutes) || cooldownMinutes <= 0 || cooldownMinutes > 1440)) errors.push("Bekleme süresi 1–1440 dakika arasında olmalı.");
+    }
+    if (targetStep === 4) {
+      if (actionEditors.length === 0) errors.push("Kuralın çalıştıracağı en az bir ışık seçmelisin.");
+      if (actionEditors.length > 32) errors.push("Bir kurala en fazla 32 cihaz ekleyebilirsin.");
+      if (actionEditors.some((action) => action.isOn !== false && action.brightnessEnabled && (!Number.isFinite(action.brightness) || action.brightness < 1 || action.brightness > 100))) errors.push("Parlaklık değerleri %1–%100 arasında olmalı.");
+      if (actionEditors.some((action) => action.isOn !== false && action.temperatureEnabled && (!Number.isFinite(action.temperature) || action.temperature < 1500 || action.temperature > 6500))) errors.push("Renk sıcaklığı 1500K–6500K arasında olmalı.");
+      if (actionEditors.some((action) => action.transitionEnabled && (!Number.isFinite(action.transitionSeconds) || action.transitionSeconds < 0 || action.transitionSeconds > 600))) errors.push("Geçiş süresi 0–600 saniye arasında olmalı.");
+      if (actionEditors.some((action) => action.isOn && action.autoOffEnabled && (!Number.isFinite(action.autoOffMinutes) || action.autoOffMinutes <= 0 || action.autoOffMinutes > 1440))) errors.push("Otomatik kapanma süresi 1–1440 dakika arasında olmalı.");
+    }
+    return errors;
+  }
+
+  const allErrors = [1, 2, 3, 4].flatMap(errorsForStep);
+  const currentErrors = step === 5 ? allErrors : errorsForStep(step);
+  const progressSteps = ["Temel bilgiler", "Tetikleyici", "Koşullar", "Eylemler", "Kontrol"];
+  const triggerSummary = triggerType === "motion"
+    ? `${devices.find((device) => device.id === triggerDevice)?.name || "Sensör"} · ${motionDetected ? "hareket algılandı" : "hareket sona erdi"}`
+    : triggerType === "button"
+      ? `${devices.find((device) => device.id === triggerDevice)?.name || "Buton"} · ${clickPattern === "doublePress" ? "çift basış" : clickPattern === "longPress" ? "uzun basış" : "tek basış"}`
+      : `Her uygun gün saat ${triggerTime}`;
+
+  async function submitRule() {
+    if (saving || allErrors.length) return;
+    setSaving(true);
+    try {
+      await onSave(draft);
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <div className="modal-layer" role="dialog" aria-modal="true" aria-labelledby="rule-builder-title">
-      <button className="modal-scrim" aria-label="Kapat" onClick={onClose} />
-      <div className="rule-builder-modal">
-        <header><div><span>KURAL OLUŞTURUCU</span><h2 id="rule-builder-title">{initialRule ? "Kuralı düzenle" : "Yeni bir akış kur"}</h2></div><button aria-label="Kapat" onClick={onClose}><X size={20} /></button></header>
-        <div className="builder-progress">{["Tetikleyici", "Koşullar", "Eylem"].map((label, index) => <button key={label} className={step === index + 1 ? "active" : step > index + 1 ? "done" : ""} onClick={() => setStep(index + 1)}><span>{step > index + 1 ? <Check size={14} /> : index + 1}</span>{label}</button>)}</div>
+      <button className="modal-scrim" aria-label="Kural oluşturucuyu kapat" onClick={onClose} />
+      <div className="rule-builder-modal advanced">
+        <header>
+          <div><span>DETAYLI OTOMASYON</span><h2 id="rule-builder-title">{initialRule ? "Kuralı düzenle" : "Yeni bir kural oluştur"}</h2></div>
+          <button type="button" aria-label="Kapat" onClick={onClose}><X size={20} /></button>
+        </header>
+        <nav className="builder-progress" aria-label="Kural oluşturma adımları">
+          {progressSteps.map((label, index) => {
+            const number = index + 1;
+            return <button type="button" key={label} disabled={number > step} className={step === number ? "active" : step > number ? "done" : ""} onClick={() => number <= step && setStep(number)}><span>{step > number ? <Check size={14} /> : number}</span>{label}</button>;
+          })}
+        </nav>
         <div className="builder-body">
           <div className="builder-form">
             {step === 1 && <>
-              <label className="field"><span>Kuralın adı</span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
-              <fieldset><legend>Ne zaman çalışsın?</legend><div className="option-grid three">
-                <button type="button" className={triggerType === "motion" ? "selected" : ""} onClick={() => selectTriggerType("motion")}><Footprints size={20} /><b>Hareket</b><small>Sensör algıladığında</small></button>
-                <button type="button" className={triggerType === "button" ? "selected" : ""} onClick={() => selectTriggerType("button")}><MousePointerClick size={20} /><b>Buton</b><small>Basış türüne göre</small></button>
-                <button type="button" className={triggerType === "time" ? "selected" : ""} onClick={() => selectTriggerType("time")}><Clock3 size={20} /><b>Saat</b><small>Belirli bir anda</small></button>
-              </div></fieldset>
-              {triggerType !== "time" ? <label className="field"><span>{triggerType === "motion" ? "Hareket sensörü" : "Buton"}</span><select value={triggerDevice} onChange={(event) => setTriggerDevice(event.target.value)}>{(triggerType === "motion" ? sensors : buttons).map((device) => <option key={device.id} value={device.id}>{device.name} · {device.room}</option>)}</select></label> : <label className="field"><span>Çalışma saati</span><input type="time" value={triggerTime} onChange={(event) => setTriggerTime(event.target.value)} /></label>}
-              {triggerType === "button" && <label className="field"><span>Basış şekli</span><select value={clickPattern} onChange={(event) => setClickPattern(event.target.value as ClickPattern)}><option value="singlePress">Tek basış</option><option value="doublePress">Çift basış</option><option value="longPress">Uzun basış</option></select></label>}
+              <div className="builder-section-heading"><span className="soft-icon"><Pencil size={19} /></span><div><h3>Kuralın temel bilgileri</h3><p>Sonradan kolayca bulabileceğin açıklayıcı bir ad ver.</p></div></div>
+              <label className={`field ${!name.trim() ? "has-error" : ""}`}><span>Kural adı <em>zorunlu</em></span><input autoFocus maxLength={121} value={name} placeholder="Örn. Çalışma odası butonuyla tüm ışıkları yönet" onChange={(event) => setName(event.target.value)} /></label>
+              <div className="builder-choice-row"><span><b>Kural kaydedildiğinde</b><small>İstersen kuralı duraklatılmış olarak hazırlayabilirsin.</small></span><div className="segmented"><button type="button" className={enabled ? "selected" : ""} onClick={() => setEnabled(true)}>Etkin</button><button type="button" className={!enabled ? "selected" : ""} onClick={() => setEnabled(false)}>Duraklat</button></div></div>
             </>}
+
             {step === 2 && <>
-              <div className="builder-section-heading"><span className="soft-icon"><Clock3 size={19} /></span><div><h3>Çalışma aralığı</h3><p>Kuralı günün uygun saatleriyle sınırla.</p></div></div>
-              {triggerType !== "time" && <div className="time-pair"><label className="field"><span>Başlangıç</span><input type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} /></label><span>—</span><label className="field"><span>Bitiş</span><input type="time" value={endTime} onChange={(event) => setEndTime(event.target.value)} /></label></div>}
-              <fieldset><legend>Hangi günler?</legend><div className="day-picker">{allWeekDays.map((day) => <button type="button" key={day} className={days.includes(day) ? "selected" : ""} onClick={() => setDays((current) => current.includes(day) ? current.filter((item) => item !== day) : [...current, day])}>{weekDayLabels[day]}</button>)}</div></fieldset>
-              <div className="condition-note"><Info size={17} /><p>Gece yarısını aşan saat aralıkları otomatik olarak ertesi güne devam eder.</p></div>
+              <div className="builder-section-heading"><span className="soft-icon"><Zap size={19} /></span><div><h3>Kuralı ne başlatacak?</h3><p>Bir tetikleyici seç; ayrıntıları seçmeden ilerleyemezsin.</p></div></div>
+              <fieldset><legend>Tetikleyici türü</legend><div className="option-grid three">
+                <button type="button" className={triggerType === "motion" ? "selected" : ""} onClick={() => selectTriggerType("motion")}><Footprints size={20} /><b>Hareket</b><small>Algılandığında veya sona erdiğinde</small></button>
+                <button type="button" className={triggerType === "button" ? "selected" : ""} onClick={() => selectTriggerType("button")}><MousePointerClick size={20} /><b>Buton</b><small>Tek, çift veya uzun basış</small></button>
+                <button type="button" className={triggerType === "time" ? "selected" : ""} onClick={() => selectTriggerType("time")}><Clock3 size={20} /><b>Saat</b><small>Belirli bir yerel saatte</small></button>
+              </div></fieldset>
+              {triggerType === "motion" && <>
+                <label className="field"><span>Hareket sensörü <em>zorunlu</em></span><select value={triggerDevice} onChange={(event) => setTriggerDevice(event.target.value)}><option value="">Sensör seç</option>{sensors.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.room}</option>)}</select></label>
+                <fieldset><legend>Hangi değişiklikte?</legend><div className="segmented"><button type="button" className={motionDetected ? "selected" : ""} onClick={() => setMotionDetected(true)}>Hareket algılandı</button><button type="button" className={!motionDetected ? "selected" : ""} onClick={() => setMotionDetected(false)}>Hareket sona erdi</button></div></fieldset>
+              </>}
+              {triggerType === "button" && <div className="two-column-fields">
+                <label className="field"><span>Buton / tuş <em>zorunlu</em></span><select value={triggerDevice} onChange={(event) => setTriggerDevice(event.target.value)}><option value="">Buton seç</option>{buttons.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.room}</option>)}</select></label>
+                <label className="field"><span>Basış şekli <em>zorunlu</em></span><select value={clickPattern} onChange={(event) => setClickPattern(event.target.value as ClickPattern)}><option value="singlePress">Tek basış</option><option value="doublePress">Çift basış</option><option value="longPress">Uzun basış</option></select></label>
+              </div>}
+              {triggerType === "time" && <label className="field"><span>Çalışma saati <em>zorunlu</em></span><input type="time" value={triggerTime} onChange={(event) => setTriggerTime(event.target.value)} /><small>Günleri bir sonraki adımda isteğe bağlı olarak sınırlandırabilirsin.</small></label>}
+              {!sensors.length && triggerType === "motion" && <div className="builder-error"><Info size={17} /><span>DIRIGERA’da kullanılabilir bir hareket sensörü bulunamadı.</span></div>}
+              {!buttons.length && triggerType === "button" && <div className="builder-error"><Info size={17} /><span>DIRIGERA’da kullanılabilir bir buton bulunamadı.</span></div>}
             </>}
+
             {step === 3 && <>
-              <div className="builder-section-heading"><span className="soft-icon"><Lightbulb size={19} /></span><div><h3>Işık eylemi</h3><p>Tetiklendiğinde ne olacağını seç.</p></div></div>
-              <label className="field"><span>Kontrol edilecek ışık</span><select value={targetDevice} onChange={(event) => setTargetDevice(event.target.value)}>{lights.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.room}</option>)}</select></label>
-              <fieldset><legend>İşlem</legend><div className="segmented"><button type="button" className={actionOn ? "selected" : ""} onClick={() => setActionOn(true)}>Işığı aç</button><button type="button" className={!actionOn ? "selected" : ""} onClick={() => setActionOn(false)}>Işığı kapat</button></div></fieldset>
-              {actionOn && <><label className="range-field"><span><b>Parlaklık</b><em>%{brightness}</em></span><input type="range" min="1" max="100" value={brightness} onChange={(event) => setBrightnessValue(Number(event.target.value))} style={{ "--range-progress": `${brightness}%` } as React.CSSProperties} /></label><label className="range-field temperature"><span><b>Renk sıcaklığı</b><em>{temperature}K</em></span><div><Moon size={15} /><input type="range" min="2200" max="4000" step="100" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} style={{ "--range-progress": `${((temperature - 2200) / 1800) * 100}%` } as React.CSSProperties} /><Sun size={15} /></div></label><label className="field"><span>Ne kadar sonra kapansın? (dakika)</span><input type="number" min="0" max="1440" value={offAfter} onChange={(event) => setOffAfter(Number(event.target.value))} /><small>0 seçersen elle kapatılana kadar açık kalır.</small></label></>}
+              <div className="builder-section-heading"><span className="soft-icon"><ListFilter size={19} /></span><div><h3>İsteğe bağlı koşullar</h3><p>Yalnızca açtığın koşullar kural JSON’una eklenir.</p></div></div>
+              <div className="optional-settings-list">
+                <OptionalSetting enabled={daysEnabled} title="Gün filtresi" copy="Kural yalnızca seçtiğin günlerde çalışsın." onToggle={() => { setDaysEnabled((current) => !current); if (!days.length) setDays(allWeekDays); }}>
+                  <fieldset><legend>Geçerli günler <em>en az bir</em></legend><div className="day-picker">{allWeekDays.map((day) => <button type="button" key={day} className={days.includes(day) ? "selected" : ""} onClick={() => toggleDay(day)}>{weekDayLabels[day]}</button>)}</div></fieldset>
+                </OptionalSetting>
+                <OptionalSetting enabled={timeWindowEnabled} title="Saat aralığı" copy="Tetikleyici gelse bile yalnızca bu aralıkta çalışsın." onToggle={() => setTimeWindowEnabled((current) => !current)}>
+                  <div className="time-pair"><label className="field"><span>Başlangıç</span><input type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} /></label><span>—</span><label className="field"><span>Bitiş</span><input type="time" value={endTime} onChange={(event) => setEndTime(event.target.value)} /></label></div>
+                  <div className="condition-note"><Info size={17} /><p>Örn. 22:00–06:00 aralığı gece yarısından sonra ertesi güne devam eder.</p></div>
+                </OptionalSetting>
+                <OptionalSetting enabled={cooldownEnabled} title="Tekrar çalışma beklemesi" copy="Peş peşe gelen olaylarda aynı kuralın çok sık çalışmasını önle." onToggle={() => setCooldownEnabled((current) => !current)}>
+                  <label className="field compact-number"><span>Bekleme süresi</span><div><input type="number" min="1" max="1440" value={cooldownMinutes} onChange={(event) => setCooldownMinutes(Number(event.target.value))} /><em>dakika</em></div></label>
+                </OptionalSetting>
+                <OptionalSetting enabled={deviceConditionsEnabled} title="Cihaz durumu koşulları" copy="Tüm satırlar doğruysa eylemleri çalıştır." onToggle={toggleDeviceConditions}>
+                  <div className="device-condition-list">
+                    {deviceConditions.map((condition, index) => {
+                      const device = devices.find((item) => item.id === condition.deviceId);
+                      const attributes = stateAttributesForDevice(device);
+                      const isNumeric = numericStateAttributes.has(condition.attribute);
+                      const [trueLabel, falseLabel] = stateValueLabels(condition.attribute);
+                      return <article className="device-condition-row" key={condition.editorId}>
+                        <span className="condition-index">VE {index + 1}</span>
+                        <label><span>Cihaz</span><select value={condition.deviceId} onChange={(event) => changeConditionDevice(condition, event.target.value)}><option value="">Cihaz seç</option>{devices.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.room}</option>)}</select></label>
+                        <label><span>Özellik</span><select value={condition.attribute} onChange={(event) => changeConditionAttribute(condition, event.target.value as DeviceStateAttribute)}>{attributes.map((attribute) => <option key={attribute} value={attribute}>{stateAttributeLabels[attribute]}</option>)}</select></label>
+                        <label><span>Karşılaştırma</span><select value={condition.operator} onChange={(event) => updateDeviceCondition(condition.editorId, { operator: event.target.value as DeviceStateOperator })}>{(isNumeric ? Object.keys(stateOperatorLabels) : ["equals", "notEquals"]).map((operator) => <option key={operator} value={operator}>{stateOperatorLabels[operator as DeviceStateOperator]}</option>)}</select></label>
+                        <label><span>Değer</span>{isNumeric ? <input type="number" min={condition.attribute === "colorTemperature" ? 1500 : 0} max={condition.attribute === "colorTemperature" ? 6500 : 100} value={condition.value as number} onChange={(event) => updateDeviceCondition(condition.editorId, { value: Number(event.target.value) })} /> : <select value={String(condition.value)} onChange={(event) => updateDeviceCondition(condition.editorId, { value: event.target.value === "true" })}><option value="true">{trueLabel}</option><option value="false">{falseLabel}</option></select>}</label>
+                        <button type="button" aria-label={`${index + 1}. koşulu sil`} onClick={() => setDeviceConditions((current) => current.filter((item) => item.editorId !== condition.editorId))}><Trash2 size={16} /></button>
+                      </article>;
+                    })}
+                    <button type="button" className="add-condition-button" disabled={!devices.length || deviceConditions.length >= 32} onClick={() => setDeviceConditions((current) => [...current, makeDeviceCondition()])}><Plus size={16} /> Koşul ekle {deviceConditions.length > 0 ? `(${deviceConditions.length}/32)` : ""}</button>
+                  </div>
+                </OptionalSetting>
+              </div>
             </>}
+
+            {step === 4 && <>
+              <div className="builder-section-heading"><span className="soft-icon"><Lightbulb size={19} /></span><div><h3>Bir veya daha fazla ışığı yönet</h3><p>Önce hedefleri seç, toplu ayarı uygula; gerekirse her ışığı ayrı özelleştir.</p></div></div>
+              <section className="target-picker">
+                <div className="target-picker-head"><span><b>Hedef cihazlar</b><small>{actionEditors.length} ışık seçili · en az bir seçim gerekli</small></span><button type="button" onClick={selectAllLights}>{actionEditors.length === lights.length && lights.length ? "Seçimi temizle" : "Tüm ışıkları seç"}</button></div>
+                <div className="target-room-actions"><span>Odaya göre:</span>{Array.from(new Set(lights.map((light) => light.room))).map((room) => { const roomLights = lights.filter((light) => light.room === room); const roomSelected = roomLights.length > 0 && roomLights.every((light) => actionEditors.some((action) => action.deviceId === light.id)); return <button type="button" key={room} className={roomSelected ? "selected" : ""} onClick={() => selectRoomLights(room)}>{room} <small>{roomLights.length}</small></button>; })}</div>
+                <div className="target-device-grid">{lights.map((light) => {
+                  const selected = actionEditors.some((action) => action.deviceId === light.id);
+                  return <button type="button" key={light.id} className={selected ? "selected" : ""} onClick={() => toggleActionDevice(light.id)}><span className="target-check">{selected && <Check size={14} />}</span><span><b>{light.name}</b><small>{light.room} · {light.online ? "çevrimiçi" : "çevrimdışı"}</small></span></button>;
+                })}</div>
+                {!lights.length && <div className="builder-empty"><Lightbulb size={20} /><span>Kontrol edilebilir bir ışık bulunamadı.</span></div>}
+              </section>
+              <section className="bulk-action-card">
+                <div className="bulk-action-title"><span><b>Toplu eylem ayarı</b><small>Parlaklık ve sıcaklık yalnızca destekleyen ışıklara uygulanır; kartlarda ayrı ayrı değiştirebilirsin.</small></span><div className="segmented"><button type="button" className={bulkOn ? "selected" : ""} onClick={() => setBulkOn(true)}>Aç</button><button type="button" className={!bulkOn ? "selected" : ""} onClick={() => setBulkOn(false)}>Kapat</button></div></div>
+                <div className="bulk-options">
+                  <label className={!bulkOn ? "is-disabled" : ""}><input type="checkbox" checked={bulkOn && bulkBrightnessEnabled} disabled={!bulkOn} onChange={(event) => setBulkBrightnessEnabled(event.target.checked)} /><span>Parlaklık</span>{bulkOn && bulkBrightnessEnabled && <input type="number" min="1" max="100" value={bulkBrightness} onChange={(event) => setBulkBrightness(Number(event.target.value))} />}{bulkOn && bulkBrightnessEnabled && <em>%</em>}</label>
+                  <label className={!bulkOn ? "is-disabled" : ""}><input type="checkbox" checked={bulkOn && bulkTemperatureEnabled} disabled={!bulkOn} onChange={(event) => setBulkTemperatureEnabled(event.target.checked)} /><span>Renk sıcaklığı</span>{bulkOn && bulkTemperatureEnabled && <input type="number" min="1500" max="6500" step="100" value={bulkTemperature} onChange={(event) => setBulkTemperature(Number(event.target.value))} />}{bulkOn && bulkTemperatureEnabled && <em>K</em>}</label>
+                  <label><input type="checkbox" checked={bulkTransitionEnabled} onChange={(event) => setBulkTransitionEnabled(event.target.checked)} /><span>Yumuşak geçiş</span>{bulkTransitionEnabled && <input type="number" min="0" max="600" value={bulkTransitionSeconds} onChange={(event) => setBulkTransitionSeconds(Number(event.target.value))} />}{bulkTransitionEnabled && <em>sn</em>}</label>
+                  <label className={!bulkOn ? "is-disabled" : ""}><input type="checkbox" checked={bulkOn && bulkAutoOffEnabled} disabled={!bulkOn} onChange={(event) => setBulkAutoOffEnabled(event.target.checked)} /><span>Otomatik kapat</span>{bulkOn && bulkAutoOffEnabled && <input type="number" min="1" max="1440" value={bulkAutoOffMinutes} onChange={(event) => setBulkAutoOffMinutes(Number(event.target.value))} />}{bulkOn && bulkAutoOffEnabled && <em>dk</em>}</label>
+                </div>
+                <button type="button" className="apply-bulk-button" disabled={!actionEditors.length} onClick={applyBulkSettings}><Sparkles size={16} /> Toplu ayarı {actionEditors.length || 0} cihaza uygula</button>
+              </section>
+              <div className="device-action-list">
+                {actionEditors.map((action) => {
+                  const device = devices.find((item) => item.id === action.deviceId);
+                  return <article className="device-action-card" key={action.deviceId}>
+                    <header><span className="device-type-icon light"><Lightbulb size={18} /></span><span><b>{device?.name || "Bilinmeyen ışık"}</b><small>{device?.room || "Odasız"} · bu cihaza özel ayarlar</small></span><button type="button" aria-label={`${device?.name || "Işık"} eylemini kaldır`} onClick={() => toggleActionDevice(action.deviceId)}><X size={16} /></button></header>
+                    {!device && <p className="action-advanced-note">Bu hedef mevcut panel cihaz listesinde görünmüyor. Eylem birebir korunur; istersen kartı kaldırabilirsin.</p>}
+                    <div className="device-action-mode segmented three"><button type="button" className={action.isOn === true ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: true })}>Aç</button><button type="button" className={action.isOn === false ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: false })}>Kapat</button><button type="button" className={action.isOn === undefined ? "selected" : ""} onClick={() => updateAction(action.deviceId, { isOn: undefined, autoOffEnabled: false })}>Durumu koru</button></div>
+                    {action.passthroughAttributes && <p className="action-advanced-note">{Object.keys(action.passthroughAttributes).length} gelişmiş DIRIGERA özniteliği değiştirilmeden korunacak.</p>}
+                    <div className="device-action-options">
+                      {action.isOn !== false && (device?.brightness !== undefined || action.brightnessEnabled) && <OptionalSetting enabled={action.brightnessEnabled} title="Parlaklık" copy="Seçilmezse mevcut parlaklık korunur." onToggle={() => updateAction(action.deviceId, { brightnessEnabled: !action.brightnessEnabled })}><label className="range-field"><span><b>Parlaklık</b><em>%{action.brightness}</em></span><input type="range" min="1" max="100" value={action.brightness} onChange={(event) => updateAction(action.deviceId, { brightness: Number(event.target.value) })} style={{ "--range-progress": `${action.brightness}%` } as React.CSSProperties} /></label></OptionalSetting>}
+                      {action.isOn !== false && (device?.temperature !== undefined || action.temperatureEnabled) && <OptionalSetting enabled={action.temperatureEnabled} title="Renk sıcaklığı" copy="Seçilmezse mevcut renk sıcaklığı korunur." onToggle={() => updateAction(action.deviceId, { temperatureEnabled: !action.temperatureEnabled })}><label className="range-field temperature"><span><b>Sıcaklık</b><em>{action.temperature}K</em></span><div><Moon size={15} /><input type="range" min="1500" max="6500" step="100" value={action.temperature} onChange={(event) => updateAction(action.deviceId, { temperature: Number(event.target.value) })} style={{ "--range-progress": `${((action.temperature - 1500) / 5000) * 100}%` } as React.CSSProperties} /><Sun size={15} /></div></label></OptionalSetting>}
+                      <OptionalSetting enabled={action.transitionEnabled} title="Yumuşak geçiş" copy="Komutu aniden değil, seçilen sürede uygula." onToggle={() => updateAction(action.deviceId, { transitionEnabled: !action.transitionEnabled })}><label className="field compact-number"><span>Geçiş süresi</span><div><input type="number" min="0" max="600" value={action.transitionSeconds} onChange={(event) => updateAction(action.deviceId, { transitionSeconds: Number(event.target.value) })} /><em>saniye</em></div></label></OptionalSetting>
+                      {action.isOn && <OptionalSetting enabled={action.autoOffEnabled} title="Otomatik kapat" copy="Bu ışığı açıldıktan sonra otomatik kapat." onToggle={() => updateAction(action.deviceId, { autoOffEnabled: !action.autoOffEnabled })}><label className="field compact-number"><span>Açık kalma süresi</span><div><input type="number" min="1" max="1440" value={action.autoOffMinutes} onChange={(event) => updateAction(action.deviceId, { autoOffMinutes: Number(event.target.value) })} /><em>dakika</em></div></label></OptionalSetting>}
+                    </div>
+                    {action.isOn === false && <p className="action-off-note">Kapatma eyleminde parlaklık, renk sıcaklığı ve otomatik kapanma gönderilmez. İstersen yalnızca geçiş süresi ekleyebilirsin.</p>}
+                  </article>;
+                })}
+              </div>
+            </>}
+
+            {step === 5 && <>
+              <div className="builder-section-heading"><span className="soft-icon"><ShieldCheck size={19} /></span><div><h3>Kaydetmeden önce kontrol et</h3><p>Yalnızca seçtiğin tetikleyici, koşul ve seçenekler köprüye gönderilecek.</p></div></div>
+              <div className="review-stack">
+                <section><span className="review-number">1</span><div><small>TETİKLEYİCİ</small><b>{triggerSummary}</b></div><button type="button" onClick={() => setStep(2)}>Düzenle</button></section>
+                <section><span className="review-number">2</span><div><small>KOŞULLAR</small><b>{!daysEnabled && !timeWindowEnabled && !cooldownEnabled && !deviceConditionsEnabled ? "Ek koşul yok · her uygun tetiklemede çalışır" : [daysEnabled ? `${days.length} gün` : null, timeWindowEnabled ? `${startTime}–${endTime}` : null, deviceConditionsEnabled ? `${deviceConditions.length} cihaz durumu` : null, cooldownEnabled ? `${cooldownMinutes} dk bekleme` : null].filter(Boolean).join(" · ")}</b></div><button type="button" onClick={() => setStep(3)}>Düzenle</button></section>
+                <section><span className="review-number">3</span><div><small>EYLEMLER</small><b>{actions.length} ışık yönetilecek</b><ul>{actions.map((action) => { const device = devices.find((item) => item.id === action.deviceId); return <li key={action.deviceId}>{device?.name || "Işık"}: {actionSettingsSummary(action)}</li>; })}</ul></div><button type="button" onClick={() => setStep(4)}>Düzenle</button></section>
+              </div>
+              <div className={`review-status ${allErrors.length ? "has-errors" : "is-ready"}`}>{allErrors.length ? <><Info size={18} /><div><b>Kural henüz kaydedilemiyor</b><p>{allErrors[0]}</p></div></> : <><Check size={18} /><div><b>Kural hazır</b><p>{enabled ? "Kaydettiğinde hemen etkinleşecek." : "Duraklatılmış olarak kaydedilecek."}</p></div></>}</div>
+              <pre className="json-preview" aria-label="Kaydedilecek kural seçenekleri">{JSON.stringify(draft, null, 2)}</pre>
+            </>}
+
+            {currentErrors.length > 0 && step !== 5 && <div className="builder-error" role="alert"><Info size={17} /><div><b>Bu adımı tamamla</b><ul>{currentErrors.map((error) => <li key={error}>{error}</li>)}</ul></div></div>}
           </div>
-          <aside className="rule-preview"><span className="preview-label">CANLI ÖZET</span><span className="preview-icon"><WandSparkles size={24} /></span><h3>{name || "İsimsiz kural"}</h3><p>{describeRule(draft, devices)}</p><div className="preview-flow"><span><b>1</b>{triggerType === "motion" ? "Hareket" : triggerType === "button" ? "Buton basışı" : triggerTime}</span><i /><span><b>2</b>{actionOn ? `%${brightness} ışık` : "Işığı kapat"}</span></div><button type="button" onClick={() => onTest(draft)}><Play size={16} /> Şimdi test et</button></aside>
+          <aside className="rule-preview"><span className="preview-label">CANLI ÖZET</span><span className="preview-icon"><WandSparkles size={24} /></span><h3>{name.trim() || "İsimsiz kural"}</h3><p>{actionEditors.length ? describeRule(draft, devices) : `${triggerSummary}. Henüz bir eylem seçilmedi.`}</p><div className="preview-flow"><span><b>1</b>{triggerType === "motion" ? "Hareket" : triggerType === "button" ? "Buton" : triggerTime}</span><i /><span><b>2</b>{actionEditors.length ? `${actionEditors.length} cihaz` : "Eylem yok"}</span></div><button type="button" disabled={allErrors.length > 0 || saving} onClick={() => onTest(draft)}><Play size={16} /> Şimdi test et</button></aside>
         </div>
-        <footer><button className="secondary-button" onClick={step === 1 ? onClose : () => setStep((current) => current - 1)}>{step === 1 ? "Vazgeç" : <><ArrowLeft size={16} /> Geri</>}</button>{step < 3 ? <button className="primary-button" onClick={() => setStep((current) => current + 1)}>Devam <ArrowRight size={16} /></button> : <button className="primary-button" onClick={() => onSave(draft)} disabled={!name.trim() || !targetDevice}><Save size={16} /> Kuralı kaydet</button>}</footer>
+        <footer><button type="button" className="secondary-button" disabled={saving} onClick={step === 1 ? onClose : () => setStep((current) => current - 1)}>{step === 1 ? "Vazgeç" : <><ArrowLeft size={16} /> Geri</>}</button>{step < 5 ? <button type="button" className="primary-button" disabled={currentErrors.length > 0 || saving} onClick={() => setStep((current) => current + 1)}>Devam <ArrowRight size={16} /></button> : <button type="button" className="primary-button" onClick={submitRule} disabled={allErrors.length > 0 || saving}><Save size={16} /> {saving ? "Kaydediliyor…" : initialRule ? "Değişiklikleri kaydet" : "Kuralı kaydet"}</button>}</footer>
       </div>
     </div>
   );

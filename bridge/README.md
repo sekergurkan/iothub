@@ -86,7 +86,15 @@ Aşağıdaki örnek, hareket algılandığında ışığı `%70` parlaklık ve `
   "conditions": {
     "days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
     "startTime": "20:00",
-    "endTime": "07:00"
+    "endTime": "07:00",
+    "deviceStates": [
+      {
+        "deviceId": "REFERENCE_LIGHT_ID",
+        "attribute": "isReachable",
+        "operator": "equals",
+        "value": true
+      }
+    ]
   },
   "actions": [
     {
@@ -106,9 +114,21 @@ Desteklenen tetikleyiciler:
 - `button`: `remotePressEvent` olayını `deviceId` ve `clickPattern` (`singlePress`, `doublePress`, `longPress`) ile eşler.
 - `time`: yerel makine saatinde `time: "HH:MM"` değerinde çalışır; tetikleyicide ayrıca `days` verilebilir.
 
-`conditions.days`, `conditions.startTime` ve `conditions.endTime` tüm tetikleyicilerde kullanılabilir. Bitiş saati başlangıçtan küçükse aralık gece yarısını geçer. `brightness`, DIRIGERA `lightLevel`; `temperature` ise `colorTemperature` özniteliğine dönüştürülür. İleri kullanım için bir aksiyonda doğrudan `attributes` ve `transitionTime` da verilebilir. Aksiyon düzeyindeki `offAfterSeconds`, kural düzeyindeki değeri geçersiz kılar.
+`conditions.days`, `conditions.startTime` ve `conditions.endTime` tüm tetikleyicilerde kullanılabilir. Bitiş saati başlangıçtan küçükse aralık gece yarısını geçer. Hiçbir koşul seçilmediyse bu alanlar JSON'a eklenmez; `days` veya `deviceStates` etkinleştirilmiş fakat boş bırakılmışsa kural reddedilir.
 
-Bridge her başarılı çalıştırmadan sonra `lastRun` ve `runCount` alanlarını kalıcı olarak günceller. Aynı WebSocket olay kimliği tekrar gelirse kural ikinci kez çalıştırılmaz.
+`conditions.deviceStates` içindeki bütün satırlar birlikte doğru olmalıdır. Desteklenen durumlar ve operatörler:
+
+- `isOn`, `isReachable`, `isDetected`: `equals`, `notEquals` ve boolean değer.
+- `lightLevel`, `batteryPercentage`: `equals`, `notEquals`, `greaterThan`, `greaterThanOrEqual`, `lessThan`, `lessThanOrEqual` ve `0-100` değer.
+- `colorTemperature`: aynı sayısal operatörler ve `1500-6500 K` değer.
+
+Durumu okunamayan veya ilgili özniteliği bulunmayan cihaz koşulu güvenli biçimde `false` kabul edilir; kural aksiyonları çalışmaz. Aynı değerlendirmede aynı cihaz yalnız bir kez okunur.
+
+Bir kuralda en fazla 32 aksiyon bulunabilir. `brightness`, DIRIGERA `lightLevel`; `temperature` ise `colorTemperature` özniteliğine dönüştürülür. İleri kullanım için bir aksiyonda doğrudan `attributes` ve `transitionTime` da verilebilir. Aksiyon düzeyindeki `offAfterSeconds`, kural düzeyindeki değeri geçersiz kılar ve yalnız cihazı açan aksiyonlarda kullanılabilir. `cooldownSeconds`, peş peşe gelen tetiklemeler arasındaki en kısa süreyi belirler. Etkinleştirilmeyen ileri seçenekler kural verisine eklenmez.
+
+Bir hedef cihaz hata verirse kural motoru diğer hedefleri yine dener. Denenen çalıştırma `lastRun` ve `runCount` alanlarına kaydedilir; sonuç `RULE_ACTIONS_PARTIAL_FAILURE` kodlu bir `bridgeRuleFailed` olayıdır. Açma komutu başarılı olduysa, daha sonraki parlaklık veya sıcaklık komutu hata verse bile güvenlik için gecikmeli kapatma zamanlayıcısı kurulur.
+
+Bridge her aksiyon denemesinden sonra `lastRun` ve `runCount` alanlarını kalıcı olarak günceller. Aynı WebSocket olay kimliği tekrar gelirse kural ikinci kez çalıştırılmaz.
 
 ## Olay akışı
 

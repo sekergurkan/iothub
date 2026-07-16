@@ -264,9 +264,17 @@ function methodNotAllowed(allowed) {
 
 function publicExecutionError(error) {
   if (!error) return undefined;
+  const code = typeof error.code === "string" ? error.code : "RULE_ACTION_FAILED";
+  const message =
+    code === "RULE_CONDITION_READ_FAILED"
+      ? "A device state condition could not be evaluated."
+      : code === "RULE_ACTIONS_PARTIAL_FAILURE"
+        ? "One or more rule targets could not be completed."
+        : "A rule action could not be completed.";
   return {
-    code: typeof error.code === "string" ? error.code : "RULE_ACTION_FAILED",
-    message: "A rule action could not be completed.",
+    code,
+    message,
+    ...(Array.isArray(error.failures) ? { failureCount: error.failures.length } : {}),
   };
 }
 
@@ -333,6 +341,7 @@ export async function createBridgeService(options = {}) {
   ruleEngine = new RuleEngine({
     rules: ruleDocument.rules,
     saveRules: (rules) => saveRuleDocument(paths, rules),
+    getDevice: (id) => hubManager.run((client) => client.devices.get({ id })),
     setDeviceAttributes: (request) =>
       hubManager.run((client) => client.devices.setAttributes(request)),
     onExecution: (execution) => eventStore.record(makeBridgeEvent(execution)),

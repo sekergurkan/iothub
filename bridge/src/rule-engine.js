@@ -23,6 +23,23 @@ const DAY_ALIASES = new Map([
 const FORBIDDEN_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const CLICK_PATTERNS = new Set(["singlePress", "doublePress", "longPress"]);
 const TRIGGER_TYPES = new Set(["motion", "occupancy", "button", "time"]);
+const DEVICE_CONDITION_ATTRIBUTES = new Map([
+  ["isOn", { type: "boolean" }],
+  ["isReachable", { type: "boolean" }],
+  ["isDetected", { type: "boolean" }],
+  ["lightLevel", { type: "number", minimum: 0, maximum: 100 }],
+  ["batteryPercentage", { type: "number", minimum: 0, maximum: 100 }],
+  ["colorTemperature", { type: "number", minimum: 1_500, maximum: 6_500 }],
+]);
+const BOOLEAN_CONDITION_OPERATORS = new Set(["equals", "notEquals"]);
+const NUMBER_CONDITION_OPERATORS = new Set([
+  "equals",
+  "notEquals",
+  "greaterThan",
+  "greaterThanOrEqual",
+  "lessThan",
+  "lessThanOrEqual",
+]);
 
 export class RuleValidationError extends Error {
   constructor(message, path = undefined) {
@@ -185,6 +202,68 @@ function normalizeConditions(input) {
   }
 
   const days = normalizeDays(input.days, "conditions.days");
+  let deviceStates;
+  if (Object.hasOwn(input, "deviceStates")) {
+    if (
+      !Array.isArray(input.deviceStates) ||
+      input.deviceStates.length === 0 ||
+      input.deviceStates.length > 32
+    ) {
+      fail(
+        "conditions.deviceStates must contain between 1 and 32 device conditions.",
+        "conditions.deviceStates",
+      );
+    }
+
+    deviceStates = input.deviceStates.map((condition, index) => {
+      const path = `conditions.deviceStates[${index}]`;
+      if (!isObject(condition)) fail(`${path} must be an object.`, path);
+
+      const deviceId = normalizeDeviceId(condition.deviceId, `${path}.deviceId`);
+      const definition = DEVICE_CONDITION_ATTRIBUTES.get(condition.attribute);
+      if (!definition) {
+        fail(
+          `${path}.attribute is not a supported device state.`,
+          `${path}.attribute`,
+        );
+      }
+
+      const supportedOperators =
+        definition.type === "boolean"
+          ? BOOLEAN_CONDITION_OPERATORS
+          : NUMBER_CONDITION_OPERATORS;
+      if (!supportedOperators.has(condition.operator)) {
+        fail(
+          `${path}.operator is not supported for ${condition.attribute}.`,
+          `${path}.operator`,
+        );
+      }
+
+      if (definition.type === "boolean") {
+        if (typeof condition.value !== "boolean") {
+          fail(`${path}.value must be a boolean.`, `${path}.value`);
+        }
+      } else if (
+        typeof condition.value !== "number" ||
+        !Number.isFinite(condition.value) ||
+        condition.value < definition.minimum ||
+        condition.value > definition.maximum
+      ) {
+        fail(
+          `${path}.value must be a number between ${definition.minimum} and ${definition.maximum}.`,
+          `${path}.value`,
+        );
+      }
+
+      return {
+        deviceId,
+        attribute: condition.attribute,
+        operator: condition.operator,
+        value: condition.value,
+      };
+    });
+  }
+
   return {
     ...(days ? { days } : {}),
     ...(startValue !== undefined
@@ -193,6 +272,7 @@ function normalizeConditions(input) {
           endTime: normalizeTime(endValue, "conditions.endTime"),
         }
       : {}),
+    ...(deviceStates ? { deviceStates } : {}),
   };
 }
 
@@ -258,6 +338,13 @@ function normalizeAction(input, index) {
     { minimum: 1, maximum: 86_400 },
   );
 
+  if (offAfterSeconds !== undefined && attributes.isOn !== true) {
+    fail(
+      `${path}.offAfterSeconds can only be used when the action turns the device on.`,
+      `${path}.offAfterSeconds`,
+    );
+  }
+
   return {
     deviceId,
     ...(input.isOn !== undefined ? { isOn: input.isOn } : {}),
@@ -315,6 +402,16 @@ export function normalizeRule(
     { minimum: 0, maximum: 86_400 },
   );
 
+  if (
+    offAfterSeconds !== undefined &&
+    !actions.some((action) => actionAttributes(action).isOn === true)
+  ) {
+    fail(
+      "offAfterSeconds requires at least one action that turns a device on.",
+      "offAfterSeconds",
+    );
+  }
+
   const now = new Date().toISOString();
   const idValue = existing?.id ?? input.id;
   const id = normalizeRuleId(idValue);
@@ -370,6 +467,66 @@ function conditionsMatch(conditions, date) {
     return !conditions.days || conditions.days.includes(previousDay);
   }
   return false;
+}
+
+function deviceConditionMatches(condition, device) {
+  if (!isObject(device)) return false;
+  if (condition.attribute !== "isReachable" && device.isReachable === false) return false;
+
+  const actualValue =
+    condition.attribute === "isReachable"
+      ? device.isReachable
+      : device.attributes?.[condition.attribute];
+  if (actualValue === undefined || actualValue === null) return false;
+  const definition = DEVICE_CONDITION_ATTRIBUTES.get(condition.attribute);
+  if (definition?.type === "boolean" && typeof actualValue !== "boolean") return false;
+  if (
+    definition?.type === "number" &&
+    (typeof actualValue !== "number" || !Number.isFinite(actualValue))
+  ) {
+    return false;
+  }
+
+  switch (condition.operator) {
+    case "equals":
+      return actualValue === condition.value;
+    case "notEquals":
+      return actualValue !== condition.value;
+    case "greaterThan":
+      return typeof actualValue === "number" && actualValue > condition.value;
+    case "greaterThanOrEqual":
+      return typeof actualValue === "number" && actualValue >= condition.value;
+    case "lessThan":
+      return typeof actualValue === "number" && actualValue < condition.value;
+    case "lessThanOrEqual":
+      return typeof actualValue === "number" && actualValue <= condition.value;
+    default:
+      return false;
+  }
+}
+
+function conditionReadError(error, deviceId) {
+  const wrapped = new Error(`The state of device ${deviceId} could not be read.`, {
+    cause: error,
+  });
+  wrapped.code = "RULE_CONDITION_READ_FAILED";
+  wrapped.deviceId = deviceId;
+  return wrapped;
+}
+
+function actionFailuresError(failures) {
+  const error = new AggregateError(
+    failures.map((failure) => failure.error),
+    `${failures.length} rule action request(s) could not be completed.`,
+  );
+  error.code = "RULE_ACTIONS_PARTIAL_FAILURE";
+  error.failures = failures.map(({ deviceId, actionIndex, requestIndex, error: cause }) => ({
+    deviceId,
+    actionIndex,
+    requestIndex,
+    code: typeof cause?.code === "string" ? cause.code : "DEVICE_ACTION_FAILED",
+  }));
+  return error;
 }
 
 function ruleIsCoolingDown(rule, now = Date.now()) {
@@ -434,6 +591,7 @@ export class RuleEngine {
   #rules;
   #saveRules;
   #setDeviceAttributes;
+  #getDevice;
   #onExecution;
   #mutationQueue = Promise.resolve();
   #running = new Set();
@@ -446,7 +604,13 @@ export class RuleEngine {
   #lastMinute = minuteKey(new Date());
   #stopped = false;
 
-  constructor({ rules, saveRules, setDeviceAttributes, onExecution = () => {} }) {
+  constructor({
+    rules,
+    saveRules,
+    setDeviceAttributes,
+    getDevice = null,
+    onExecution = () => {},
+  }) {
     this.#rules = rules.map((rule, index) => {
       try {
         return normalizeRule(rule, { stored: true });
@@ -467,6 +631,7 @@ export class RuleEngine {
     }
     this.#saveRules = saveRules;
     this.#setDeviceAttributes = setDeviceAttributes;
+    this.#getDevice = getDevice;
     this.#onExecution = onExecution;
   }
 
@@ -574,12 +739,13 @@ export class RuleEngine {
     }
 
     const eventDate = Number.isFinite(Date.parse(event.time)) ? new Date(event.time) : new Date();
-    const matches = this.#rules.filter(
+    const candidates = this.#rules.filter(
       (rule) =>
         rule.enabled &&
         eventMatchesTrigger(rule.trigger, event) &&
         conditionsMatch(rule.conditions, eventDate),
     );
+    const matches = await this.#filterByDeviceConditions(candidates, event);
     await Promise.allSettled(matches.map((rule) => this.#execute(rule, event)));
   }
 
@@ -591,7 +757,7 @@ export class RuleEngine {
     const time = `${String(date.getHours()).padStart(2, "0")}:${String(
       date.getMinutes(),
     ).padStart(2, "0")}`;
-    const matches = this.#rules.filter(
+    const candidates = this.#rules.filter(
       (rule) =>
         rule.enabled &&
         rule.trigger.type === "time" &&
@@ -599,7 +765,52 @@ export class RuleEngine {
         dayMatches(rule.trigger.days, date) &&
         conditionsMatch(rule.conditions, date),
     );
-    await Promise.allSettled(matches.map((rule) => this.#execute(rule, { type: "time", time })));
+    const triggerEvent = { type: "time", time };
+    const matches = await this.#filterByDeviceConditions(candidates, triggerEvent);
+    await Promise.allSettled(matches.map((rule) => this.#execute(rule, triggerEvent)));
+  }
+
+  async #filterByDeviceConditions(rules, triggerEvent) {
+    const deviceCache = new Map();
+    const results = await Promise.all(
+      rules.map(async (rule) => {
+        const conditions = rule.conditions.deviceStates;
+        if (!conditions) return true;
+
+        for (const condition of conditions) {
+          try {
+            if (typeof this.#getDevice !== "function") {
+              const error = new Error("Device state conditions are unavailable.");
+              error.code = "RULE_CONDITION_UNAVAILABLE";
+              throw error;
+            }
+            if (!deviceCache.has(condition.deviceId)) {
+              deviceCache.set(
+                condition.deviceId,
+                Promise.resolve().then(() => this.#getDevice(condition.deviceId)),
+              );
+            }
+            const device = await deviceCache.get(condition.deviceId);
+            if (!deviceConditionMatches(condition, device)) return false;
+          } catch (error) {
+            const wrapped = conditionReadError(error, condition.deviceId);
+            this.#onExecution({
+              status: "error",
+              source: "condition",
+              ruleId: rule.id,
+              ruleName: rule.name,
+              deviceId: condition.deviceId,
+              triggerEvent,
+              error: wrapped,
+              at: new Date().toISOString(),
+            });
+            return false;
+          }
+        }
+        return true;
+      }),
+    );
+    return rules.filter((_, index) => results[index]);
   }
 
   async #execute(rule, triggerEvent) {
@@ -637,21 +848,34 @@ export class RuleEngine {
   async #executeOnce(rule, triggerEvent) {
     const startedAt = new Date().toISOString();
     try {
-      for (const action of rule.actions) {
+      const failures = [];
+      for (const [actionIndex, action] of rule.actions.entries()) {
         const attributes = actionAttributes(action);
         const actionVersion = this.#beginDeviceAction(action.deviceId);
-        for (const attributeRequest of actionAttributeRequests(attributes)) {
-          await this.#setDeviceAttributes({
-            id: action.deviceId,
-            attributes: attributeRequest,
-            transitionTime: action.transitionTime,
-          });
+        let turnedOn = false;
+        const requests = actionAttributeRequests(attributes);
+        for (const [requestIndex, attributeRequest] of requests.entries()) {
+          try {
+            await this.#setDeviceAttributes({
+              id: action.deviceId,
+              attributes: attributeRequest,
+              transitionTime: action.transitionTime,
+            });
+            if (attributeRequest.isOn === true) turnedOn = true;
+          } catch (error) {
+            failures.push({
+              deviceId: action.deviceId,
+              actionIndex,
+              requestIndex,
+              error,
+            });
+          }
         }
 
         const delay = action.offAfterSeconds ?? rule.offAfterSeconds;
         if (
           delay &&
-          attributes.isOn === true &&
+          turnedOn &&
           this.#deviceActionVersions.get(action.deviceId) === actionVersion
         ) {
           this.#scheduleOff(rule, action, delay, actionVersion);
@@ -659,6 +883,7 @@ export class RuleEngine {
       }
 
       await this.#recordRun(rule.id, startedAt);
+      if (failures.length) throw actionFailuresError(failures);
       this.#onExecution({
         status: "success",
         ruleId: rule.id,
