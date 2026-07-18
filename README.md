@@ -45,7 +45,7 @@ npm start --prefix bridge
 
 Hub daha önce eşleştirilmediyse **Köprüye bağlan** düğmesine bastıktan sonra DIRIGERA'nın altındaki işlem düğmesine 60 saniye içinde basın. mDNS keşfi çalışmazsa aynı ekranda hub'ın yerel IP adresini de yazabilirsiniz. DIRIGERA access token'ı tarayıcıya gönderilmez; yalnızca `bridge/.data/config.json` içinde yerel olarak saklanır.
 
-Yayımlanan web adresi arayüzü ve demo evini her yerden açabilir; gerçek DIRIGERA komutları yine ev ağındaki köprüye ulaşabildiğiniz cihazlarda çalışır. Tarayıcı yerel ağ erişim izni isterse onaylayın. En sorunsuz gerçek ev kullanımı için paneli köprüyle aynı makinede `http://localhost:3000` üzerinden açın veya köprünün önüne ev ağınıza ait bir HTTPS reverse proxy koyun.
+Yuva yalnızca yerel kullanım için yapılandırılmıştır. Paneli köprüyle aynı makinede `http://localhost:3000` üzerinden açın. Başka bir ev cihazından erişim gerekiyorsa köprünün önüne ev ağınıza ait bir HTTPS reverse proxy koyun.
 
 Köprünün API, ağ erişimi ve güvenlik ayarları için [bridge/README.md](bridge/README.md) dosyasına bakın.
 

@@ -69,6 +69,8 @@ const FIXTURE_ENTITIES = [
   { entity_id: "switch.camera_c701_privacy", device_id: "camera", platform: "xiaomi_home" },
   { entity_id: "event.camera_c701_someone_appeared", device_id: "camera", platform: "xiaomi_home", original_name: "Ai Detection Someone Appeared" },
   { entity_id: "event.camera_c701_no_human_appear", device_id: "camera", platform: "xiaomi_home", original_name: "Ai Detection No Human Appear" },
+  { entity_id: "event.camera_c701_detected_babycry_event", device_id: "camera", platform: "xiaomi_home", original_name: "Ai Detection Detected Babycry Event" },
+  { entity_id: "event.camera_c701_pet_appeared", device_id: "camera", platform: "xiaomi_home", original_name: "Ai Detection Pet Appeared" },
 ];
 
 const FIXTURE_STATES = [
@@ -96,6 +98,8 @@ const FIXTURE_STATES = [
   { entity_id: "switch.camera_c701_privacy", state: "off", attributes: { friendly_name: "Camera C701 Privacy" } },
   { entity_id: "event.camera_c701_someone_appeared", state: "2026-07-16T10:00:00+00:00", last_changed: "2026-07-16T10:00:00+00:00", attributes: { friendly_name: "Camera C701 Someone Appeared" } },
   { entity_id: "event.camera_c701_no_human_appear", state: "2026-07-16T09:55:00+00:00", last_changed: "2026-07-16T09:55:00+00:00", attributes: { friendly_name: "Camera C701 No Human Appear" } },
+  { entity_id: "event.camera_c701_detected_babycry_event", state: "2026-07-16T09:50:00+00:00", last_changed: "2026-07-16T09:50:00+00:00", attributes: { friendly_name: "Camera C701 Detected Babycry Event", event_type: "Detected Babycry Event" } },
+  { entity_id: "event.camera_c701_pet_appeared", state: "unknown", last_changed: "2026-07-16T09:45:00+00:00", attributes: { friendly_name: "Camera C701 Pet Appeared", event_type: null } },
 ];
 
 function jsonResponse(value, status = 200) {
@@ -192,6 +196,18 @@ test("Home Assistant manager exposes Xiaomi devices and maps controls to service
   );
 
   const socket = FakeWebSocket.instances[0];
+  const someoneState = FIXTURE_STATES.find(
+    (state) => state.entity_id === "event.camera_c701_someone_appeared",
+  );
+  const noHumanState = FIXTURE_STATES.find(
+    (state) => state.entity_id === "event.camera_c701_no_human_appear",
+  );
+  const babyCryState = FIXTURE_STATES.find(
+    (state) => state.entity_id === "event.camera_c701_detected_babycry_event",
+  );
+  const petState = FIXTURE_STATES.find(
+    (state) => state.entity_id === "event.camera_c701_pet_appeared",
+  );
   socket.emit(
     "message",
     Buffer.from(
@@ -203,8 +219,8 @@ test("Home Assistant manager exposes Xiaomi devices and maps controls to service
           time_fired: "2026-07-16T10:05:00.000Z",
           data: {
             entity_id: "event.camera_c701_someone_appeared",
-            old_state: FIXTURE_STATES.at(-2),
-            new_state: { ...FIXTURE_STATES.at(-2), state: "2026-07-16T10:05:00+00:00", last_changed: "2026-07-16T10:05:00+00:00" },
+            old_state: someoneState,
+            new_state: { ...someoneState, state: "2026-07-16T10:05:00+00:00", last_changed: "2026-07-16T10:05:00+00:00" },
           },
         },
       }),
@@ -224,8 +240,8 @@ test("Home Assistant manager exposes Xiaomi devices and maps controls to service
           time_fired: "2026-07-16T10:06:00.000Z",
           data: {
             entity_id: "event.camera_c701_no_human_appear",
-            old_state: FIXTURE_STATES.at(-1),
-            new_state: { ...FIXTURE_STATES.at(-1), state: "2026-07-16T10:06:00+00:00", last_changed: "2026-07-16T10:06:00+00:00" },
+            old_state: noHumanState,
+            new_state: { ...noHumanState, state: "2026-07-16T10:06:00+00:00", last_changed: "2026-07-16T10:06:00+00:00" },
           },
         },
       }),
@@ -234,6 +250,88 @@ test("Home Assistant manager exposes Xiaomi devices and maps controls to service
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(
     events.filter((event) => event.type === "deviceEvent" && event.data.eventType === "personDetected").length,
+    1,
+  );
+
+  socket.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        id: 1_001,
+        type: "event",
+        event: {
+          event_type: "state_changed",
+          time_fired: "2026-07-16T10:07:00.000Z",
+          data: {
+            entity_id: "event.camera_c701_pet_appeared",
+            old_state: petState,
+            new_state: {
+              ...petState,
+              state: "2026-07-16T10:07:00+00:00",
+              last_changed: "2026-07-16T10:07:00+00:00",
+              attributes: { ...petState.attributes, event_type: "Pet Appeared" },
+            },
+          },
+        },
+      }),
+    ),
+  );
+  socket.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        id: 1_002,
+        type: "event",
+        event: {
+          event_type: "state_changed",
+          time_fired: "2026-07-16T10:07:00.100Z",
+          data: {
+            entity_id: "event.camera_c701_detected_babycry_event",
+            old_state: babyCryState,
+            new_state: {
+              ...babyCryState,
+              attributes: { ...babyCryState.attributes, refreshed: true },
+            },
+          },
+        },
+      }),
+    ),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    events.filter((event) => event.type === "deviceEvent" && event.data.eventType === "petDetected").length,
+    1,
+  );
+  assert.equal(
+    events.filter((event) => event.type === "deviceEvent" && event.data.eventType === "babyCry").length,
+    0,
+  );
+
+  socket.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        id: 1_003,
+        type: "event",
+        event: {
+          event_type: "state_changed",
+          time_fired: "2026-07-16T10:08:00.000Z",
+          data: {
+            entity_id: "event.camera_c701_detected_babycry_event",
+            old_state: babyCryState,
+            new_state: {
+              ...babyCryState,
+              state: "2026-07-16T10:08:00+00:00",
+              last_changed: "2026-07-16T10:08:00+00:00",
+            },
+          },
+        },
+      }),
+    ),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    events.filter((event) => event.type === "deviceEvent" && event.data.eventType === "babyCry").length,
     1,
   );
 });

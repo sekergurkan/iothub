@@ -691,6 +691,7 @@ export class HomeAssistantManager {
   async #handleStateChanged(event) {
     const entityId = event?.data?.entity_id;
     if (typeof entityId !== "string") return;
+    const cachedState = this.#states.get(entityId);
     const previousDevices = new Map(
       [...this.#groups.entries()].map(([id, group]) => [id, group.canonical]),
     );
@@ -730,9 +731,16 @@ export class HomeAssistantManager {
     };
     const mappedEventType = eventTypeFor(changedEntity);
     const domain = domainOf(entityId);
+    const previousState = event.data.old_state ?? cachedState;
+    const eventStateAdvanced =
+      newState &&
+      previousState &&
+      typeof newState.state === "string" &&
+      !["", "unknown", "unavailable"].includes(newState.state) &&
+      newState.state !== previousState.state;
     const becameActive =
-      domain === "event" ||
-      (domain === "binary_sensor" && newState?.state === "on" && event.data.old_state?.state !== "on");
+      (domain === "event" && eventStateAdvanced) ||
+      (domain === "binary_sensor" && newState?.state === "on" && previousState?.state !== "on");
     if (mappedEventType && becameActive) {
       await Promise.resolve(
         this.#onEvent({
